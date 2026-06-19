@@ -161,6 +161,7 @@ pub use verifiable_intent::VerifiableIntentTool;
 pub const REENTRANT_AGENT_TOOLS: &[&str] = &[SpawnSubagentTool::NAME, DelegateTool::NAME];
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
+use crate::security::policy::SandboxPolicy;
 use crate::security::{Sandbox, SecurityPolicy, create_sandbox};
 use crate::sop::audit::SopAuditLogger;
 use crate::sop::engine::SopEngine;
@@ -657,6 +658,7 @@ fn runtime_shell_assembly(
     root_config: &Config,
 ) -> RuntimeShellAssembly {
     let sandbox_cfg = risk_profile.sandbox_config();
+    let sandbox_policy = SandboxPolicy::from_risk_profile(risk_profile, &security.workspace_dir);
     let sandbox_extra_roots = crate::security::SandboxExtraRoots {
         read_write: security.allowed_roots.clone(),
         read_only: security.allowed_roots_read_only.clone(),
@@ -664,6 +666,7 @@ fn runtime_shell_assembly(
     };
     let sandbox = create_sandbox(
         &sandbox_cfg,
+        &sandbox_policy,
         root_config.runtime.kind,
         Some(&security.workspace_dir),
         &sandbox_extra_roots,

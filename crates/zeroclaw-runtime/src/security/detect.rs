@@ -1,5 +1,6 @@
 //! Auto-detection of available security features
 
+use crate::security::policy::SandboxPolicy;
 use crate::security::traits::Sandbox;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -337,8 +338,21 @@ fn sandbox_backend_name(backend: &SandboxBackend) -> &'static str {
     }
 }
 
+/// Create a sandbox based on auto-detection or explicit config.
+///
+/// Takes a [`SandboxConfig`] (synthesized from the active risk profile via
+/// `RiskProfileConfig::sandbox_config()`) and a resolved [`SandboxPolicy`]
+/// (from `SandboxPolicy::from_risk_profile`). When the caller has set
+/// `runtime.kind` to the native runtime, Docker must never be selected as the
+/// sandbox backend during auto-detection — the user explicitly opted out of
+/// container wrapping.
+///
+/// `policy` is accepted to establish a stable call-site contract but is not
+/// yet forwarded to individual backends; sandbox selection is currently driven
+/// solely by `SandboxConfig` and `runtime_kind`.
 pub fn create_sandbox(
     sandbox: &SandboxConfig,
+    _policy: &SandboxPolicy,
     runtime_kind: RuntimeKind,
     workspace_dir: Option<&Path>,
     extra_roots: &SandboxExtraRoots,
@@ -633,6 +647,11 @@ pub fn linux_memcg_available() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::policy::SandboxPolicy;
+
+    fn default_policy() -> SandboxPolicy {
+        SandboxPolicy::default()
+    }
 
     #[test]
     fn detect_best_sandbox_returns_something() {
@@ -651,6 +670,7 @@ mod tests {
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
+            &default_policy(),
             RuntimeKind::Cloudflare,
             None,
             &SandboxExtraRoots::default(),
@@ -679,12 +699,13 @@ mod tests {
     #[test]
     fn auto_mode_detects_something() {
         let sandbox_cfg = SandboxConfig {
-            enabled: None, // Auto-detect
+            enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
+            &default_policy(),
             RuntimeKind::Cloudflare,
             None,
             &SandboxExtraRoots::default(),
@@ -727,6 +748,7 @@ mod tests {
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
+            &default_policy(),
             RuntimeKind::Native,
             None,
             &SandboxExtraRoots::default(),
@@ -752,6 +774,7 @@ mod tests {
         };
         let sandbox = create_sandbox(
             &sandbox_cfg,
+            &default_policy(),
             RuntimeKind::Native,
             None,
             &SandboxExtraRoots::default(),
