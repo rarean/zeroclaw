@@ -115,6 +115,7 @@ fn balanced_risk() -> RiskProfileConfig {
         sandbox_enabled: Some(true),
         sandbox_backend: None,
         firejail_args: vec![],
+        sandbox_policy: SandboxPolicyConfig::default(),
     }
 }
 
