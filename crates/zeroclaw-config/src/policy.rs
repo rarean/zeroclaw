@@ -510,6 +510,12 @@ pub(crate) fn default_forbidden_paths() -> Vec<String> {
         "/proc".into(),
         "/sys".into(),
         "/var".into(),
+        // Modern Linux distros symlink `/var/run` -> `/run` (systemd compat),
+        // so canonicalizing a probe under the old path resolves away the
+        // `/var` prefix entirely and would otherwise bypass this list.
+        // `/run` holds equally sensitive runtime state (control sockets,
+        // secrets mounts, per-user runtime dirs), so it needs its own entry.
+        "/run".into(),
         "/tmp".into(),
         "~/.ssh".into(),
         "~/.gnupg".into(),
@@ -3283,6 +3289,26 @@ impl SecurityPolicy {
         true
     }
 
+    /// Deepest (most specific) forbidden match depth for `resolved`, with each
+    /// `forbidden_paths` entry first resolved the same way the read/write gates
+    /// resolve it (`resolve_policy_entry`: `~` expansion, then relative entries
+    /// joined onto `workspace_dir`). Unlike the free
+    /// [`deepest_forbidden_depth`] — which compares raw config spellings and so
+    /// cannot see workspace-relative deny entries — this derives depths in the
+    /// exact namespace the gates authorize in. `None` when no entry matches.
+    fn deepest_resolved_forbidden_depth(&self, resolved: &Path) -> Option<usize> {
+        let mut best: Option<usize> = None;
+        for forbidden in &self.forbidden_paths {
+            let forbidden_path = resolve_policy_entry(forbidden, &self.workspace_dir);
+            if let Some(depth) =
+                namespace_prefix_match_depth(&forbidden_path, resolved, PathMatchNamespace::Resolved)
+            {
+                best = Some(best.map_or(depth, |b| b.max(depth)));
+            }
+        }
+        best
+    }
+
     pub fn is_resolved_path_readable(&self, resolved: &Path) -> bool {
         // Keep the target in the same filesystem namespace as every policy
         // prefix, even when a caller supplies an absolute but not yet fully
@@ -3305,58 +3331,15 @@ impl SecurityPolicy {
             }
         }
 
-<<<<<<< HEAD
         // Workspace + read-write allowlist + read-only allowlist.
         // Inlined rather than delegating to `is_resolved_path_allowed`
         // so the write-only allowlist is intentionally NOT in scope
         // here.
-=======
-        // Explicit allow tiers run BEFORE the deny check so `allow_read`
-        // re-allows within an otherwise denied region (RFC precedence:
-        // explicit allow > deny > default allow). Inlined rather than
-        // delegating to `is_resolved_path_allowed` so the write-only
-        // allowlist is intentionally NOT in scope here.
-        for root in &self.allowed_roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
-        for root in &self.allowed_roots_read_only {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
-
->>>>>>> 430a5c7cc (fix: Resolve workspace changes)
         let workspace_root = self
             .workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
 
-<<<<<<< HEAD
-        let allow_depth = deepest_allow_depth(
-            &workspace_root,
-            &[&self.allowed_roots, &self.allowed_roots_read_only],
-            resolved,
-            PathMatchNamespace::Resolved,
-        );
-
-        if allow_depth.is_some() {
-            // Deny-before-allow: an explicit `forbidden_paths` entry at least as
-            // specific as the allowing root denies reads even inside the
-            // workspace or a read allowlist. A broad default forbidden root
-            // (e.g. `/home`) does not override a more specific allowlist entry.
-            let forbidden_depth = deepest_forbidden_depth(
-                &self.forbidden_paths,
-                resolved,
-                PathMatchNamespace::Resolved,
-            );
-            if forbidden_overrides_allow(forbidden_depth, allow_depth) {
-                return false;
-            }
-=======
         // Deny gate for entries THAT RESOLVE INSIDE THE WORKSPACE runs
         // BEFORE the workspace blanket grant, so a workspace-relative
         // `deny_read`/`forbidden_paths` entry (e.g. `.secrets`) actually
@@ -3375,14 +3358,36 @@ impl SecurityPolicy {
         // workspace root itself.
         for forbidden in &self.forbidden_paths {
             let forbidden_path = resolve_policy_entry(forbidden, &self.workspace_dir);
-            if forbidden_path.starts_with(&workspace_root) && resolved.starts_with(&forbidden_path)
+            // `forbidden_path != workspace_root` excludes the case where a
+            // broad default forbidden root (e.g. `/tmp`) happens to BE the
+            // workspace root itself (a temp-dir-based workspace) — that is
+            // not a workspace-relative deny entry, just an external root
+            // that coincides with the workspace, and must not shadow the
+            // workspace grant below.
+            if forbidden_path != workspace_root
+                && forbidden_path.starts_with(&workspace_root)
+                && resolved.starts_with(&forbidden_path)
             {
                 return false;
             }
         }
 
-        if resolved.starts_with(&workspace_root) {
->>>>>>> 430a5c7cc (fix: Resolve workspace changes)
+        let allow_depth = deepest_allow_depth(
+            &workspace_root,
+            &[&self.allowed_roots, &self.allowed_roots_read_only],
+            resolved,
+            PathMatchNamespace::Resolved,
+        );
+
+        if allow_depth.is_some() {
+            // Deny-before-allow: an explicit `forbidden_paths` entry at least as
+            // specific as the allowing root denies reads even inside the
+            // workspace or a read allowlist. A broad default forbidden root
+            // (e.g. `/home`) does not override a more specific allowlist entry.
+            let forbidden_depth = self.deepest_resolved_forbidden_depth(resolved);
+            if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+                return false;
+            }
             return true;
         }
 
@@ -3393,29 +3398,15 @@ impl SecurityPolicy {
             }
         }
 
-<<<<<<< HEAD
-        // Forbidden paths gate after the explicit allowlists so the
-        // allowlists can coexist with broad default forbidden roots
-        // such as `/home` and `/tmp`.
-        if deepest_forbidden_depth(
-            &self.forbidden_paths,
-            resolved,
-            PathMatchNamespace::Resolved,
-        )
-        .is_some()
-        {
-            return false;
-=======
         // General forbidden-path gate for paths OUTSIDE the workspace and
         // outside every explicit allow tier — this is the original
         // "allowlists coexist with broad default forbidden roots" gate,
         // unchanged in position, now just resolved via `resolve_policy_entry`.
-        for forbidden in &self.forbidden_paths {
-            let forbidden_path = resolve_policy_entry(forbidden, &self.workspace_dir);
-            if resolved.starts_with(&forbidden_path) {
-                return false;
-            }
->>>>>>> 430a5c7cc (fix: Resolve workspace changes)
+        if self
+            .deepest_resolved_forbidden_depth(resolved)
+            .is_some()
+        {
+            return false;
         }
 
         if !self.workspace_only {
@@ -6801,7 +6792,25 @@ mod tests {
             !p.is_resolved_path_allowed(&canonicalize_best_effort(Path::new("/etc/passwd"))),
             "forbidden paths must be blocked even when workspace_only=false"
         );
+
+        // Second forbidden entry, exercised via a fabricated directory rather
+        // than a real-world path like `/var/run/docker.sock`: on modern Linux,
+        // `/var/run` is itself a symlink to `/run` (systemd compat), so
+        // canonicalizing that probe resolves away the `/var` prefix before
+        // this check ever sees it, regardless of enforcement. A synthetic
+        // root with no OS-defined symlink keeps this test meaningful across
+        // platforms.
+        let forbidden_root = std::env::temp_dir().join("zeroclaw_test_forbidden_root");
+        let _ = std::fs::create_dir_all(&forbidden_root);
+        let canonical_forbidden_root = forbidden_root
+            .canonicalize()
+            .unwrap_or_else(|_| forbidden_root.clone());
+        let p2 = SecurityPolicy {
+            forbidden_paths: vec![canonical_forbidden_root.to_string_lossy().into_owned()],
+            ..p.clone()
+        };
         assert!(
+<<<<<<< HEAD
 <<<<<<< HEAD
             !p.is_resolved_path_allowed(Path::new("/var/zeroclaw-forbidden-test/nonexistent.sock")),
 =======
@@ -6810,7 +6819,12 @@ mod tests {
             ))),
 >>>>>>> 430a5c7cc (fix: Resolve workspace changes)
             "forbidden /var must be blocked even when workspace_only=false"
+=======
+            !p2.is_resolved_path_allowed(&canonical_forbidden_root.join("nested/secret")),
+            "forbidden entry must block nested nonexistent paths beneath it"
+>>>>>>> d39077235 (fix: commit hygiene)
         );
+        let _ = std::fs::remove_dir_all(&forbidden_root);
 
         let _ = std::fs::remove_dir_all(&workspace);
     }
