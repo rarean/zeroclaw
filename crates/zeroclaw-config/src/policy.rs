@@ -825,6 +825,7 @@ impl Default for SecurityPolicy {
                     .iter()
                     .map(|s| (*s).to_string())
                     .collect(),
+                allow_write_is_explicit: false,
                 deny_write: Vec::new(),
                 mandatory_deny_write_enabled: true,
                 allowed_domains: Vec::new(),
@@ -1039,10 +1040,15 @@ struct SandboxDerivedTiers {
 /// mixed legacy/canonical config can grant read via one field and write via
 /// another). `allowed_roots_read_only` is `allow_read` minus that
 /// intersection; `allowed_roots_write_only` is `allow_write` minus the
-/// intersection, minus the resolved [`crate::schema::DEFAULT_ALLOW_WRITE`]
-/// roots and the workspace root itself (the schema default write roots exist
-/// to satisfy OS-sandbox bind-mount needs, not as an app-layer grant — see
-/// `SandboxPolicyConfig` docs).
+/// intersection, minus the workspace root itself, minus the resolved
+/// [`crate::schema::DEFAULT_ALLOW_WRITE`] roots — but ONLY when `allow_write`
+/// arrived via the omitted-field fallback (`effective.allow_write_is_explicit
+/// == false`). The schema default write roots exist to satisfy OS-sandbox
+/// bind-mount needs when the operator never touched `allow_write`, not as an
+/// app-layer grant (see `SandboxPolicyConfig` docs) — but an operator who
+/// explicitly writes `sandbox_policy.allow_write = ["/tmp"]` must get that
+/// grant for real, even though it is shaped identically to the default. See
+/// `explicit_tmp_allow_write_is_honored_by_app_path_guard`.
 fn sandbox_derived_tiers(
     effective: &crate::sandbox_policy::EffectiveSandboxInputs,
     workspace_dir: &Path,
@@ -1063,10 +1069,14 @@ fn sandbox_derived_tiers(
         .cloned()
         .collect();
 
-    let mut excluded_from_write_only: Vec<PathBuf> = crate::schema::DEFAULT_ALLOW_WRITE
-        .iter()
-        .map(|s| crate::sandbox_policy::resolve_path(s, workspace_dir))
-        .collect();
+    let mut excluded_from_write_only: Vec<PathBuf> = if effective.allow_write_is_explicit {
+        Vec::new()
+    } else {
+        crate::schema::DEFAULT_ALLOW_WRITE
+            .iter()
+            .map(|s| crate::sandbox_policy::resolve_path(s, workspace_dir))
+            .collect()
+    };
     excluded_from_write_only.push(workspace_dir.to_path_buf());
 
     let allowed_roots_write_only: Vec<PathBuf> = resolved
@@ -3507,22 +3517,11 @@ impl SecurityPolicy {
 
         // For paths outside workspace/allowlist, block forbidden roots to
         // prevent symlink escapes and sensitive directory access.
-<<<<<<< HEAD
-        if deepest_forbidden_depth(
-            &self.forbidden_paths,
-            resolved,
-            PathMatchNamespace::Resolved,
-        )
-        .is_some()
-        {
-            return false;
-=======
         for forbidden in &self.forbidden_paths {
             let forbidden_path = resolve_policy_entry(forbidden, &self.workspace_dir);
             if resolved.starts_with(&forbidden_path) {
                 return false;
             }
->>>>>>> 430a5c7cc (fix: Resolve workspace changes)
         }
 
         // When workspace_only is disabled the user explicitly opted out of
@@ -6810,19 +6809,8 @@ mod tests {
             ..p.clone()
         };
         assert!(
-<<<<<<< HEAD
-<<<<<<< HEAD
-            !p.is_resolved_path_allowed(Path::new("/var/zeroclaw-forbidden-test/nonexistent.sock")),
-=======
-            !p.is_resolved_path_allowed(&canonicalize_best_effort(Path::new(
-                "/var/run/docker.sock"
-            ))),
->>>>>>> 430a5c7cc (fix: Resolve workspace changes)
-            "forbidden /var must be blocked even when workspace_only=false"
-=======
             !p2.is_resolved_path_allowed(&canonical_forbidden_root.join("nested/secret")),
             "forbidden entry must block nested nonexistent paths beneath it"
->>>>>>> d39077235 (fix: commit hygiene)
         );
         let _ = std::fs::remove_dir_all(&forbidden_root);
 
@@ -8445,6 +8433,39 @@ mod tests {
              merge, got allowed_roots={:?} write_only={:?}",
             policy.allowed_roots,
             policy.allowed_roots_write_only
+        );
+    }
+
+    #[test]
+    fn explicit_tmp_allow_write_is_honored_by_app_path_guard() {
+        // Regression (PR #7821 review, IftekharUddin, 2026-07-23): an
+        // operator-explicit `sandbox_policy.allow_write = ["/tmp"]` was being
+        // silently stripped from `allowed_roots_write_only` by
+        // `sandbox_derived_tiers`'s unconditional `DEFAULT_ALLOW_WRITE`
+        // exclusion, even though the field's own contract says an explicit
+        // `Some(v)` always wins, even when shaped like the prior default.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec!["/tmp".to_string()]);
+
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+        assert!(
+            is_write_granted(&policy, "/tmp"),
+            "explicit allow_write=[\"/tmp\"] must be honored, got allowed_roots={:?} \
+             write_only={:?}",
+            policy.allowed_roots,
+            policy.allowed_roots_write_only
+        );
+
+        // Exercise the actual admission check too, not just tier membership —
+        // handles the macOS /tmp -> /private/tmp canonicalization case.
+        let probe = canonicalize_best_effort(Path::new("/tmp")).join("zeroclaw_test_probe");
+        assert!(
+            policy.is_resolved_path_allowed(&probe),
+            "explicit /tmp write grant must admit a resolved path under /tmp"
         );
     }
 
