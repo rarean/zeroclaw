@@ -1077,7 +1077,15 @@ fn sandbox_derived_tiers(
             .map(|s| crate::sandbox_policy::resolve_path(s, workspace_dir))
             .collect()
     };
-    excluded_from_write_only.push(workspace_dir.to_path_buf());
+    // The workspace root is dropped from the write-only tier only when the
+    // workspace carries its own implicit write grant — i.e. when `allow_write`
+    // was omitted, so `is_resolved_path_allowed` still grants the workspace
+    // blanket-style. Under an EXPLICIT `allow_write` that blanket grant is
+    // withdrawn, so a workspace entry in the explicit list is the only thing
+    // keeping the workspace writable and must survive into a real tier.
+    if !effective.allow_write_is_explicit {
+        excluded_from_write_only.push(workspace_dir.to_path_buf());
+    }
 
     let allowed_roots_write_only: Vec<PathBuf> = resolved
         .allow_write
@@ -3488,15 +3496,38 @@ impl SecurityPolicy {
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
 
+        // The workspace carries an implicit write grant, but only while no
+        // canonical write allowlist exists. An EXPLICIT `allow_write` (including
+        // an explicit empty list) is authoritative for every path, workspace
+        // descendants included — the workspace then stays writable only by being
+        // named in that list, which lands it in a write-capable tier checked
+        // below. Without this gate a narrow explicit allowlist silently kept the
+        // whole workspace writable, contradicting the
+        // `SandboxPolicyConfig::allow_write` contract ("All other paths are
+        // denied for writes"). The implicit grant participates in the
+        // depth-specificity comparison below (deny at least as specific as the
+        // workspace still denies) instead of returning early.
+        //
         // Extra allowed roots and write-only cross-agent grants authorize this
         // write path. `is_resolved_path_readable` intentionally does not include
         // write-only roots because `AccessMode::Write` is one-way by design.
-        let allow_depth = deepest_allow_depth(
-            &workspace_root,
-            &[&self.allowed_roots, &self.allowed_roots_write_only],
-            resolved,
-            PathMatchNamespace::Resolved,
-        );
+        let mut allow_depth: Option<usize> = None;
+        if !self.sandbox_inputs.allow_write_is_explicit {
+            if let Some(depth) =
+                namespace_prefix_match_depth(&workspace_root, resolved, PathMatchNamespace::Resolved)
+            {
+                allow_depth = Some(depth);
+            }
+        }
+        for root in self
+            .allowed_roots
+            .iter()
+            .chain(self.allowed_roots_write_only.iter())
+        {
+            if let Some(depth) = namespace_prefix_match_depth(root, resolved, PathMatchNamespace::Resolved) {
+                allow_depth = Some(allow_depth.map_or(depth, |b| b.max(depth)));
+            }
+        }
 
         if allow_depth.is_some() {
             // Deny-before-allow: an explicit `forbidden_paths` entry at least as
@@ -3838,8 +3869,21 @@ impl SecurityPolicy {
         // `/srv` accepts; a child of `/srv` under a parent of
         // `/srv/app` does not). Containment, not exact equality, lets
         // the child legitimately narrow scope.
+        //
+        // Tier membership is not the only way a parent can hold a grant: the
+        // parent's own workspace is writable (and readable) without appearing
+        // in any tier, and an explicit `allow_write` naming the workspace puts
+        // the workspace into a tier for the child but not for a parent that
+        // omitted the field. So each loop falls back to asking the canonical
+        // guard whether the PARENT policy itself admits that path. This can
+        // only accept roots the parent genuinely holds — it never widens the
+        // child beyond the parent's own envelope — and it keeps the canonical
+        // policy, rather than a tier's shape, as the source of truth.
         for root in &self.allowed_roots {
-            if !parent.allowed_roots.iter().any(|p| path_contains(p, root)) {
+            let in_parent_tier = parent.allowed_roots.iter().any(|p| path_contains(p, root));
+            let parent_grants_rw =
+                parent.is_resolved_path_allowed(root) && parent.is_resolved_path_readable(root);
+            if !in_parent_tier && !parent_grants_rw {
                 return Err(EscalationViolation::ReadWriteRootNotInParent { path: root.clone() });
             }
         }
@@ -3849,7 +3893,7 @@ impl SecurityPolicy {
                 .allowed_roots_read_only
                 .iter()
                 .any(|p| path_contains(p, root));
-            if !in_parent_rw && !in_parent_ro {
+            if !in_parent_rw && !in_parent_ro && !parent.is_resolved_path_readable(root) {
                 return Err(EscalationViolation::ReadOnlyRootNotInParent { path: root.clone() });
             }
         }
@@ -3859,7 +3903,7 @@ impl SecurityPolicy {
                 .allowed_roots_write_only
                 .iter()
                 .any(|p| path_contains(p, root));
-            if !in_parent_rw && !in_parent_wo {
+            if !in_parent_rw && !in_parent_wo && !parent.is_resolved_path_allowed(root) {
                 return Err(EscalationViolation::WriteOnlyRootNotInParent { path: root.clone() });
             }
         }
@@ -7765,6 +7809,66 @@ mod tests {
     }
 
     #[test]
+    fn ensure_no_escalation_accepts_child_whose_explicit_allow_write_names_its_workspace() {
+        // An explicit `allow_write` naming the workspace puts the workspace
+        // into the child's write-capable tier, while a parent that omitted the
+        // field holds the same workspace as an untiered implicit grant. Tier
+        // membership alone therefore reads that as an escalation; asking the
+        // parent's own guard shows it grants exactly that path. Without this,
+        // every subagent whose profile adopts the canonical `allow_write`
+        // field fails to spawn under a legacy-configured parent.
+        let workspace = Path::new("/workspace");
+        let parent_profile = crate::schema::RiskProfileConfig::default();
+        let parent = SecurityPolicy::from_risk_profile(&parent_profile, workspace);
+
+        let mut child_profile = crate::schema::RiskProfileConfig::default();
+        child_profile.sandbox_policy.allow_write = Some(vec![".".to_string()]);
+        let child = SecurityPolicy::from_risk_profile(&child_profile, workspace);
+
+        assert!(
+            child
+                .allowed_roots_write_only
+                .contains(&workspace.to_path_buf()),
+            "precondition: an explicit allow_write naming the workspace tiers it, got {:?}",
+            child.allowed_roots_write_only
+        );
+        assert!(
+            child.ensure_no_escalation_beyond(&parent).is_ok(),
+            "a child confined to its parent's own workspace is not an escalation: {:?}",
+            child.ensure_no_escalation_beyond(&parent)
+        );
+    }
+
+    #[test]
+    fn ensure_no_escalation_rejects_write_only_root_the_parent_cannot_write() {
+        // The canonical-guard fallback must only accept paths the parent
+        // genuinely holds. Here the parent's own explicit allow_write covers
+        // /granted alone, so a child claiming /elsewhere is still an
+        // escalation even though neither policy tiers the workspace.
+        let workspace = Path::new("/workspace");
+        let mut parent_profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        parent_profile.sandbox_policy.allow_write = Some(vec!["/granted".to_string()]);
+        let parent = SecurityPolicy::from_risk_profile(&parent_profile, workspace);
+
+        let child = SecurityPolicy {
+            allowed_roots_write_only: vec![PathBuf::from("/elsewhere")],
+            ..parent.clone()
+        };
+
+        let err = child
+            .ensure_no_escalation_beyond(&parent)
+            .expect_err("a write root outside the parent's envelope must be rejected");
+        assert!(matches!(
+            err,
+            EscalationViolation::WriteOnlyRootNotInParent { ref path }
+            if path == &PathBuf::from("/elsewhere")
+        ));
+    }
+
+    #[test]
     fn ensure_no_escalation_accepts_identical_policy() {
         let parent = parent_policy_for_escalation_tests();
         let child = parent.clone();
@@ -8704,6 +8808,112 @@ mod tests {
             policy.is_resolved_path_allowed(Path::new("/anywhere/output.txt")),
             "omitted allow_write with workspace_only=false must preserve the legacy \
              unrestricted-write compatibility behavior"
+        );
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/workspace/unlisted.txt")),
+            "omitted allow_write must keep the implicit workspace write grant"
+        );
+    }
+
+    #[test]
+    fn explicit_allow_write_denies_unlisted_workspace_path() {
+        // The workspace blanket write grant is an IMPLICIT grant that only holds
+        // while no canonical allowlist exists. With a narrow explicit allow_write,
+        // an unlisted path inside the workspace must be denied exactly like an
+        // unlisted path outside it — otherwise the canonical allowlist governs
+        // only external paths and the far more common in-workspace write stays
+        // wide open.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec!["/workspace/granted".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/workspace/unlisted.txt")),
+            "explicit allow_write must deny an unlisted path INSIDE the workspace"
+        );
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/workspace/granted/file.txt")),
+            "the explicitly granted in-workspace root must stay writable"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/unlisted/output.txt")),
+            "explicit allow_write must still deny unlisted external paths"
+        );
+    }
+
+    #[test]
+    fn explicit_empty_allow_write_denies_workspace_paths() {
+        // An explicit empty list denies everything, workspace included — the
+        // workspace is not a privileged exception to an authoritative allowlist.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec![]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/workspace/output.txt")),
+            "explicit empty allow_write must deny in-workspace paths too"
+        );
+    }
+
+    #[test]
+    fn explicit_allow_write_naming_workspace_grants_workspace_descendants() {
+        // The other half of the contract: an explicit list that DOES name the
+        // workspace (here via the relative "." entry, which resolves onto the
+        // workspace root) keeps workspace writes working. This is what operators
+        // migrating to the canonical field will write, so it must not require
+        // spelling out an absolute workspace path.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec![".".to_string(), "/data".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/workspace/nested/file.txt")),
+            "an explicit allow_write naming the workspace must grant its descendants"
+        );
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/data/file.txt")),
+            "the other explicit entry must remain writable"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/elsewhere/file.txt")),
+            "paths outside the explicit list stay denied"
+        );
+    }
+
+    #[test]
+    fn workspace_only_keeps_workspace_writable_despite_explicit_allow_write() {
+        // workspace_only = true overrides allow_write entirely (allow_write is
+        // forced to the workspace root). Gating the implicit workspace grant on
+        // explicitness must not strand that override: the workspace stays
+        // writable through the resolved write tier, and the overridden explicit
+        // entry gains nothing.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: true,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec!["/granted".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            policy.is_resolved_path_allowed(Path::new("/workspace/file.txt")),
+            "workspace_only must keep the workspace writable even with an explicit allow_write"
+        );
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/granted/file.txt")),
+            "workspace_only overrides the explicit allow_write entry"
         );
     }
 
