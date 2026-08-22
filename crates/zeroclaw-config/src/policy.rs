@@ -3433,6 +3433,20 @@ impl SecurityPolicy {
         false
     }
 
+    /// Whether any `forbidden_paths`/`deny_read` entry resolves to a location
+    /// AT OR BENEATH `root`. Intended for callers that hand `root` to a
+    /// recursive external process (e.g. `rg`/`grep`) which cannot re-check
+    /// `is_resolved_path_readable` per file it returns: a directory-level
+    /// authorization of `root` says nothing about nested denials further
+    /// down the tree, so those callers must use this to detect when they
+    /// need to fall back to a per-file canonical check instead. Assumes
+    /// `root` has already itself passed [`Self::is_resolved_path_readable`].
+    pub fn has_nested_read_denial(&self, root: &Path) -> bool {
+        self.forbidden_paths
+            .iter()
+            .any(|forbidden| resolve_policy_entry(forbidden, &self.workspace_dir).starts_with(root))
+    }
+
     /// Return the canonical allowlisted root directory that authorizes reading
     /// `resolved`: the workspace first, then read-write roots, then read-only
     /// roots. Callers bind a directory-handle-scoped open (cap-std beneath/
@@ -8367,6 +8381,44 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_rooted_at_default_forbidden_root_stays_readable() {
+        // Regression: when `workspace_dir` IS EXACTLY a broad default
+        // forbidden root (e.g. `std::env::temp_dir()` resolving to `/tmp`
+        // on Linux runners), `resolve_policy_entry("/tmp", workspace_dir)`
+        // returns a path equal to `workspace_root`. The workspace-relative
+        // deny gate above used `forbidden_path.starts_with(&workspace_root)`
+        // to detect "this forbidden entry is inside the workspace" — but
+        // `starts_with` also matches when the two paths are EQUAL, so a
+        // workspace that merely happens to sit at a default forbidden root
+        // had every read rejected before ever reaching the workspace grant.
+        // Broad external forbidden roots must not shadow the workspace
+        // grant just because they coincide with it (see the write-side
+        // equivalent, which grants the workspace before ever consulting
+        // `forbidden_paths`).
+        // Use the literal `/tmp` entry from `default_forbidden_paths` as the
+        // workspace root directly, rather than relying on
+        // `std::env::temp_dir()` happening to equal it (true on Linux CI
+        // runners, but NOT on macOS, where it resolves under
+        // `/var/folders/...`) — this keeps the regression reproducible on
+        // every platform this crate targets.
+        #[cfg(not(target_os = "windows"))]
+        let literal_forbidden_root = std::path::PathBuf::from("/tmp");
+        #[cfg(target_os = "windows")]
+        let literal_forbidden_root = std::path::PathBuf::from(r"C:\Windows");
+
+        let workspace_root = literal_forbidden_root
+            .canonicalize()
+            .unwrap_or(literal_forbidden_root);
+        let profile = crate::schema::RiskProfileConfig::default();
+        let policy = SecurityPolicy::from_risk_profile(&profile, &workspace_root);
+
+        assert!(
+            policy.is_resolved_path_readable(&workspace_root.join("some_file.txt")),
+            "a workspace rooted at a default forbidden root must still grant reads inside it"
+        );
     }
 
     #[test]
