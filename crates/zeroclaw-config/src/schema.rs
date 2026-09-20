@@ -7,6 +7,7 @@ pub mod v2;
 use crate::autonomy::AutonomyLevel;
 use crate::autonomy::DelegationPolicy;
 use crate::domain_matcher::DomainMatcher;
+use crate::pairing::{PAIRING_CODE_MAX_LENGTH, PAIRING_CODE_MIN_LENGTH, PairingCodePolicy};
 use crate::traits::{ChannelConfig, HasPropKind, PropKind};
 use crate::validation_bail;
 use anyhow::{Context, Result};
@@ -30,6 +31,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "model_provider.copilot",
     "model_provider.gemini",
     "model_provider.glm",
+    "model_provider.hailo_ollama",
     "model_provider.ollama",
     "model_provider.openai",
     "model_provider.openrouter",
@@ -45,6 +47,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "channel.telegram",
     "channel.wechat",
     "channel.whatsapp",
+    "tool.a2a",
     "tool.browser",
     "tool.composio",
     "tool.http_request",
@@ -489,6 +492,29 @@ pub struct Config {
     #[nested]
     pub risk_profiles: HashMap<String, RiskProfileConfig>,
 
+    /// OIDC trust relationships (`[oidc.<alias>]`). Each entry names one
+    /// issuer whose identities this daemon accepts and how their verified
+    /// claims map to permission profiles. Any standards-compliant IdP
+    /// works; there is no per-vendor configuration.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub oidc: HashMap<String, OidcConfig>,
+
+    /// Local user roster (`[users.<name>]`) for credential-to-principal
+    /// mapping of local auth providers (peer credentials today). OIDC
+    /// identities are NOT listed here; they are keyed by issuer + subject.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub users: HashMap<String, UserConfig>,
+
+    /// Named permission profiles (`[permission_profiles.<alias>]`): the
+    /// single runtime authorization vocabulary. OIDC claim mappings and
+    /// user roster entries resolve here; deny-by-default — anything a
+    /// profile does not grant is refused.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub permission_profiles: HashMap<String, PermissionProfileConfig>,
+
     /// Named runtime/LLM execution profiles (`[runtime_profiles.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -856,7 +882,7 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// HTTP request timeout in seconds. Bump this for slow local model_providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise.
+    /// HTTP request timeout in seconds. Bump this for slow local model_providers (Ollama on CPU, big local models) or high-latency networks; leave unset otherwise. When set above 300 it also raises the provider's streaming idle bound (default 300 s, the maximum gap between stream reads) on OpenAI-compatible and OpenAI Responses providers.
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
@@ -911,6 +937,29 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay_assistant_reasoning: Option<bool>,
+    /// Forward Anthropic prompt caching through this OpenAI-compatible
+    /// provider. When true, request bodies on the structured paths (agent
+    /// turns, tool calls, structured streaming) gain an Anthropic-shaped
+    /// `cache_control` breakpoint on the system prompt and on the last
+    /// message once the conversation has more than one non-system message,
+    /// mirroring the native Anthropic provider's placement strategy, and
+    /// gateway-reported cache usage populates the cached-token counters.
+    /// With `merge_system_into_user`, the merged first user message carries
+    /// the system breakpoint instead. The text-only helpers (`chat_with_system`,
+    /// `chat_with_history`, the legacy chunk-stream APIs) deliberately emit
+    /// no breakpoints: their responses drop usage, so a premium cache write
+    /// they triggered could never be accounted for.
+    /// Only gateways that translate between OpenAI Chat Completions and the
+    /// Anthropic Messages API forward these breakpoints (e.g. LiteLLM).
+    /// Default `false`: request bodies and response handling are unchanged.
+    ///
+    /// Before relying on it, verify the configured route serves cache reads:
+    /// an immediate repeat of a cache-creating request must report
+    /// `cache_read_input_tokens > 0`. Some gateway routes accept and bill
+    /// cache writes without ever serving reads.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cache_passthrough: bool,
     /// Pull live token prices for this provider's models from its own
     /// OpenAI-compatible `/models` listing (the gateway is the source of truth
     /// for its prices), filling cost-tracking rates for models the operator
@@ -1158,6 +1207,18 @@ pub struct AnthropicModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+    /// Models Anthropic may fall back to **server-side, inside one API call**
+    /// when the requested model's safety classifiers decline a request
+    /// (`stop_reason: "refusal"`). Sent as the native `fallbacks` parameter with
+    /// the `server-side-fallback-2026-06-01` beta; entries are tried in order,
+    /// must differ from the requested model, and must be permitted fallback
+    /// targets for it (e.g. `claude-fable-5` → `["claude-opus-4-8"]`; a
+    /// non-permitted entry is rejected by the API). Applies to non-streaming
+    /// requests only. Distinct from the generic `fallback_models`, which
+    /// ZeroClaw itself retries client-side after an error. Empty (the default)
+    /// sends no fallback parameter and no beta value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_fallback_models: Vec<String>,
 }
 
 // ── Moonshot (multi-region exemplar) ──
@@ -1363,6 +1424,40 @@ pub struct OllamaModelProviderConfig {
     pub temperature_override: Option<f64>,
 }
 
+// ── Hailo-Ollama (native local-default endpoint) ──
+
+/// Native Hailo-Ollama loopback endpoint used when an alias omits `uri`.
+pub const HAILO_OLLAMA_DEFAULT_URI: &str = "http://localhost:8000";
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HailoOllamaEndpoint {
+    #[default]
+    LocalDefault,
+}
+
+impl ModelEndpoint for HailoOllamaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => HAILO_OLLAMA_DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.hailo_ollama"]
+pub struct HailoOllamaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_timeout_secs: Option<u64>,
+}
+
 // ── Together ──
 
 #[derive(
@@ -1448,6 +1543,81 @@ pub struct GroqModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
+}
+
+// ── Crusoe ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CrusoeEndpoint {
+    #[default]
+    Default,
+}
+
+impl CrusoeEndpoint {
+    /// Canonical Crusoe Managed Inference endpoint. Single source of truth —
+    /// `CompatFamilySpec::DEFAULT_URL` for `CrusoeModelProviderConfig` references
+    /// this const so the schema and factory surfaces never drift.
+    pub const DEFAULT_URI: &'static str = "https://api.inference.crusoecloud.com/v1";
+}
+
+impl ModelEndpoint for CrusoeEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => Self::DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.crusoe"]
+pub struct CrusoeModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+#[cfg(test)]
+mod crusoe_tests {
+    use super::*;
+
+    #[test]
+    fn crusoe_endpoint_uri() {
+        assert_eq!(
+            CrusoeEndpoint::Default.uri(),
+            "https://api.inference.crusoecloud.com/v1"
+        );
+    }
+
+    #[test]
+    fn crusoe_config_defaults_empty() {
+        let cfg = CrusoeModelProviderConfig::default();
+        assert!(cfg.base.api_key.is_none());
+        assert!(cfg.base.model.is_none());
+    }
+
+    #[test]
+    fn crusoe_alias_round_trips_through_config() {
+        let toml = r#"
+[providers.models.crusoe.default]
+model = "deepseek-ai/DeepSeek-V4-Flash"
+"#;
+        let config: Config = toml::from_str(toml).expect("crusoe alias deserializes");
+        let alias = config
+            .providers
+            .models
+            .crusoe
+            .get("default")
+            .expect("crusoe.default present");
+        assert_eq!(
+            alias.base.model.as_deref(),
+            Some("deepseek-ai/DeepSeek-V4-Flash")
+        );
+    }
 }
 
 // ── Mistral ──
@@ -3414,6 +3584,7 @@ impl_default_family_endpoint! {
     AtomicChatModelProviderConfig,
     OpenRouterModelProviderConfig,
     OllamaModelProviderConfig,
+    HailoOllamaModelProviderConfig,
     TogetherModelProviderConfig,
     FireworksModelProviderConfig,
     GroqModelProviderConfig,
@@ -3423,6 +3594,7 @@ impl_default_family_endpoint! {
     PerplexityModelProviderConfig,
     XaiModelProviderConfig,
     CerebrasModelProviderConfig,
+    CrusoeModelProviderConfig,
     SambanovaModelProviderConfig,
     HyperbolicModelProviderConfig,
     DeepinfraModelProviderConfig,
@@ -3518,11 +3690,21 @@ pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
     pub max_history_messages: usize,
-    /// Token budget for preemptive context/history trimming (from runtime profile).
+    /// Optional operator context budget from `runtime_profiles.<name>.max_context_tokens`.
+    /// Without an opt-in ratio, `None` preserves the legacy 32,000-token budget.
+    /// With a ratio, `Some(n)` clamps the model-relative threshold down to `n`.
+    /// Every positive result is also capped by the selected model capacity.
+    /// `Some(0)` disables proactive token-budget trimming.
     /// NOT the provider `max_tokens` output limit.
-    pub max_context_tokens: usize,
+    pub max_context_tokens: Option<usize>,
     /// Model's context window (max input tokens) — from provider config.
     pub model_context_window: usize,
+    /// Whether `model_context_window` came from the selected provider profile
+    /// or from the compatibility fallback for unknown/unconfigured capacity.
+    pub model_context_window_source: ModelContextWindowSource,
+    /// Opt-in fraction of `model_context_window` at which proactive trimming
+    /// triggers. `None` preserves the legacy absolute-budget behavior.
+    pub context_compact_ratio: Option<f64>,
     pub parallel_tools: bool,
     pub tool_dispatcher: String,
     pub strict_tool_parsing: bool,
@@ -3540,17 +3722,133 @@ pub struct ResolvedRuntime {
     pub prompt_injection_mode: SkillsPromptInjectionMode,
 }
 
-impl ResolvedRuntime {
-    /// Effective token budget for preemptive whole-turn history trimming.
-    /// When `history_pruning.enabled` is set, an explicit `max_tokens` floor
-    /// trims earlier than the hard context ceiling; otherwise the ceiling is
-    /// the only trigger. Reuses the existing `history_pruning.*` idents.
-    pub fn effective_context_budget(&self) -> usize {
-        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
-            self.max_context_tokens.min(self.history_pruning.max_tokens)
-        } else {
-            self.max_context_tokens
+/// Historical proactive context budget used when an operator sets neither an
+/// absolute budget nor the opt-in model-relative ratio.
+///
+/// Shares its value with [`UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`] — the legacy
+/// default budget was exactly the unconfigured-window stub — but is a distinct
+/// concept: this is a proactive-trim budget default, not a model-capacity
+/// fallback. Kept as a named alias so the two never drift and each call site
+/// reads as the concept it means.
+pub const LEGACY_DEFAULT_CONTEXT_BUDGET: usize = UNCONFIGURED_CONTEXT_WINDOW_FALLBACK;
+
+/// Provenance of the model capacity used for one route. The compatibility
+/// fallback remains usable for internal safety calculations, but callers can
+/// avoid presenting it as configured model truth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ModelContextWindowSource {
+    Configured,
+    #[default]
+    CompatibilityFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedModelContextWindow {
+    pub tokens: usize,
+    pub source: ModelContextWindowSource,
+}
+
+/// Capacity and proactive-trim budget resolved together for one selected
+/// provider alias and model. This is a per-route materialized view, not a new
+/// configuration source: model capacity remains owned by provider config and
+/// budget policy remains owned by the agent's runtime profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedContextLimits {
+    pub model_context_window: usize,
+    pub model_context_window_source: ModelContextWindowSource,
+    pub context_token_budget: usize,
+}
+
+impl ResolvedContextLimits {
+    /// Compatibility-fallback limits for paths that cannot resolve a route
+    /// (missing config or an empty agent alias): the unconfigured-window
+    /// fallback with the caller's budget preserved — `0` stays `0` (proactive
+    /// trimming disabled), any positive value is clamped to that window.
+    #[must_use]
+    pub fn legacy_fallback(budget: usize) -> Self {
+        Self {
+            model_context_window: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
+            context_token_budget: if budget == 0 {
+                0
+            } else {
+                budget.min(UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
+            },
         }
+    }
+
+    /// Return capacity only when it is configured for the selected route.
+    /// Wire/UI consumers use absence to distinguish the 32k compatibility
+    /// fallback from known model capacity.
+    #[must_use]
+    pub fn configured_model_context_window(self) -> Option<usize> {
+        (self.model_context_window_source == ModelContextWindowSource::Configured)
+            .then_some(self.model_context_window)
+    }
+}
+
+impl ResolvedRuntime {
+    /// Resolve capacity and proactive budget for this runtime snapshot.
+    #[must_use]
+    pub fn context_limits(&self) -> ResolvedContextLimits {
+        self.context_limits_for_model_window(self.model_context_window)
+    }
+
+    /// Apply this runtime policy to a route-selected model capacity.
+    #[must_use]
+    pub fn context_limits_for_model_window(
+        &self,
+        model_context_window: usize,
+    ) -> ResolvedContextLimits {
+        let model_context_window = if model_context_window > 0 {
+            model_context_window
+        } else {
+            UNCONFIGURED_CONTEXT_WINDOW_FALLBACK
+        };
+
+        // Preserve the established disable sentinel before applying any
+        // ratio, pruning floor, or positive-value normalization.
+        if self.max_context_tokens == Some(0) {
+            return ResolvedContextLimits {
+                model_context_window,
+                model_context_window_source: self.model_context_window_source,
+                context_token_budget: 0,
+            };
+        }
+
+        let ratio = self
+            .context_compact_ratio
+            .filter(|ratio| *ratio > 0.0 && *ratio <= 1.0);
+        let mut context_token_budget = ratio.map_or_else(
+            || {
+                self.max_context_tokens
+                    .unwrap_or(LEGACY_DEFAULT_CONTEXT_BUDGET)
+            },
+            |ratio| ((model_context_window as f64 * ratio) as usize).max(1),
+        );
+
+        // In ratio mode an explicit absolute budget remains an operator cap.
+        if ratio.is_some()
+            && let Some(ceiling) = self.max_context_tokens
+        {
+            context_token_budget = context_token_budget.min(ceiling);
+        }
+        if self.history_pruning.enabled && self.history_pruning.max_tokens > 0 {
+            context_token_budget = context_token_budget.min(self.history_pruning.max_tokens);
+        }
+        // Capacity is a hard invariant for every positive effective budget.
+        // Preserve zero as the explicit proactive-trimming disable sentinel.
+        context_token_budget = context_token_budget.min(model_context_window);
+        ResolvedContextLimits {
+            model_context_window,
+            model_context_window_source: self.model_context_window_source,
+            context_token_budget,
+        }
+    }
+
+    /// Effective token budget for preemptive whole-turn history trimming.
+    pub fn effective_context_budget(&self) -> usize {
+        self.context_limits().context_token_budget
     }
 }
 
@@ -3560,8 +3858,10 @@ impl Default for ResolvedRuntime {
             compact_context: true,
             max_tool_iterations: 10,
             max_history_messages: 50,
-            max_context_tokens: 32_000,
+            max_context_tokens: None,
             model_context_window: 32_000,
+            model_context_window_source: ModelContextWindowSource::CompatibilityFallback,
+            context_compact_ratio: None,
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             strict_tool_parsing: false,
@@ -4198,12 +4498,21 @@ impl Config {
     }
 
     #[must_use]
-    pub fn effective_max_context_tokens(&self, agent_alias: &str) -> usize {
-        // Token budget for preemptive context/history trimming (runtime profile override).
-        // This is NOT the provider max_tokens output limit and NOT the model's context window.
+    pub fn effective_max_context_tokens(&self, agent_alias: &str) -> Option<usize> {
+        // Optional operator budget from the runtime profile. `None` retains the
+        // legacy 32k default unless the model-relative ratio is explicitly set.
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.max_context_tokens)
-            .unwrap_or(32_000)
+    }
+
+    /// Optional fraction of the selected model's context window at which
+    /// proactive trimming fires. Invalid values are treated as unset so they
+    /// cannot silently opt an existing profile into model-relative budgeting.
+    #[must_use]
+    pub fn effective_context_compact_ratio(&self, agent_alias: &str) -> Option<f64> {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.context_compact_ratio)
+            .filter(|r| *r > 0.0 && *r <= 1.0)
     }
 
     /// The model's context window exactly as configured, or `None` when no
@@ -4227,8 +4536,141 @@ impl Config {
     /// Does NOT check runtime profile (that's for output budget).
     #[must_use]
     pub fn effective_model_context_window(&self, agent_alias: &str) -> usize {
-        self.configured_model_context_window(agent_alias)
-            .unwrap_or(UNCONFIGURED_CONTEXT_WINDOW_FALLBACK)
+        self.resolved_model_context_window(agent_alias).tokens
+    }
+
+    /// Resolve model capacity and its provenance for an agent's configured
+    /// route. Unknown agents and unconfigured capacities retain the numeric
+    /// compatibility fallback while remaining explicitly identifiable.
+    #[must_use]
+    pub fn resolved_model_context_window(&self, agent_alias: &str) -> ResolvedModelContextWindow {
+        let Some(agent) = self.agents.get(agent_alias) else {
+            return ResolvedModelContextWindow {
+                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                source: ModelContextWindowSource::CompatibilityFallback,
+            };
+        };
+        let model = self
+            .model_provider_for_agent(agent_alias)
+            .and_then(|provider| provider.model.as_deref())
+            .unwrap_or_default();
+        self.resolved_model_context_window_for_route(agent.model_provider.as_str(), model)
+    }
+
+    /// Resolve model capacity for the provider alias and model selected for a
+    /// turn. `context_window` describes the model configured on that alias; a
+    /// different per-session model override therefore falls back to the legacy
+    /// unknown-capacity value instead of borrowing metadata for another model.
+    #[must_use]
+    pub fn effective_model_context_window_for_route(
+        &self,
+        model_provider_ref: &str,
+        selected_model: &str,
+    ) -> usize {
+        self.resolved_model_context_window_for_route(model_provider_ref, selected_model)
+            .tokens
+    }
+
+    /// Resolve capacity for exactly the selected provider profile and model.
+    /// A model mismatch or missing positive `context_window` is an explicit
+    /// compatibility fallback, never borrowed metadata from another model.
+    #[must_use]
+    pub fn resolved_model_context_window_for_route(
+        &self,
+        model_provider_ref: &str,
+        selected_model: &str,
+    ) -> ResolvedModelContextWindow {
+        let configured =
+            model_provider_ref
+                .split_once('.')
+                .and_then(|(provider_type, provider_alias)| {
+                    self.providers.models.find(provider_type, provider_alias)
+                });
+        let selected_model = selected_model.trim();
+        let configured_model = configured
+            .and_then(|provider| provider.model.as_deref())
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+
+        let configured_window = configured
+            .filter(|_| {
+                selected_model.is_empty()
+                    || configured_model.is_none()
+                    || configured_model == Some(selected_model)
+            })
+            .and_then(|provider| provider.context_window)
+            .filter(|window| *window > 0);
+
+        configured_window.map_or(
+            ResolvedModelContextWindow {
+                tokens: UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                source: ModelContextWindowSource::CompatibilityFallback,
+            },
+            |tokens| ResolvedModelContextWindow {
+                tokens,
+                source: ModelContextWindowSource::Configured,
+            },
+        )
+    }
+
+    /// Resolve one route's capacity and proactive budget from their canonical
+    /// owners: the selected provider alias/model and the agent runtime profile.
+    #[must_use]
+    pub fn resolved_context_limits_for_route(
+        &self,
+        agent_alias: &str,
+        model_provider_ref: &str,
+        selected_model: &str,
+    ) -> ResolvedContextLimits {
+        let model_context_window =
+            self.resolved_model_context_window_for_route(model_provider_ref, selected_model);
+        let mut runtime = ResolvedRuntime {
+            max_context_tokens: self.effective_max_context_tokens(agent_alias),
+            model_context_window: model_context_window.tokens,
+            model_context_window_source: model_context_window.source,
+            context_compact_ratio: self.effective_context_compact_ratio(agent_alias),
+            ..ResolvedRuntime::default()
+        };
+        if let Some(profile) = self.runtime_profile_for_agent(agent_alias) {
+            runtime.history_pruning = profile.history_pruning.clone();
+        }
+        runtime.context_limits()
+    }
+
+    /// Provider's explicit `context_window` for the served model, or `None`.
+    /// Use on wire boundaries: emitting the 32k stub from
+    /// `effective_model_context_window()` would freeze the client
+    /// meter at 32k instead of the profile budget. Use this instead
+    /// of the agent-alias variant when the live provider identity is
+    /// known (e.g., from `Agent.attribution_fields().1` or
+    /// `SessionOverrides.model_provider`). Returns `None` when the
+    /// ref is unparseable, the entry has no `context_window`, or the
+    /// served model does not match the entry's configured primary
+    /// `model`, so the wire omission path preserves absence (no 32k
+    /// stub leak) and fallback/vision/override models never borrow
+    /// another model's capacity.
+    #[must_use]
+    pub fn model_provider_context_window_opt(
+        &self,
+        provider_ref: &str,
+        model: &str,
+    ) -> Option<usize> {
+        let (type_key, alias_key) = provider_ref.split_once('.')?;
+        let (_, _, cfg) = self
+            .providers
+            .models
+            .iter_entries()
+            .find(|(ty, al, _)| *ty == type_key && *al == alias_key)?;
+        let configured = cfg
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let served = model.trim();
+        if served.is_empty() || configured != served {
+            return None;
+        }
+        cfg.context_window
     }
 
     #[must_use]
@@ -4306,13 +4748,17 @@ impl Config {
     #[must_use]
     pub fn resolved_agent_config(&self, agent_alias: &str) -> Option<AliasedAgentConfig> {
         let mut out = self.agents.get(agent_alias)?.clone();
+        let model_context_window = self.resolved_model_context_window(agent_alias);
         let mut resolved = ResolvedRuntime {
             max_tool_iterations: self.effective_max_tool_iterations(agent_alias),
             max_history_messages: self.effective_max_history_messages(agent_alias),
-            // Token budget for context/history trimming — from runtime profile
+            // Absolute operator budget. In opt-in ratio mode it also caps the
+            // model-derived threshold (see `effective_context_budget`).
             max_context_tokens: self.effective_max_context_tokens(agent_alias),
             // Model's context window (max input tokens) — from provider config
-            model_context_window: self.effective_model_context_window(agent_alias),
+            model_context_window: model_context_window.tokens,
+            model_context_window_source: model_context_window.source,
+            context_compact_ratio: self.effective_context_compact_ratio(agent_alias),
             compact_context: self.effective_compact_context(agent_alias),
             parallel_tools: self.effective_parallel_tools(agent_alias),
             tool_dispatcher: self.effective_tool_dispatcher(agent_alias),
@@ -6542,6 +6988,18 @@ pub struct MultimodalConfig {
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
+    ///
+    /// Measured on decoded bytes, so the encoded request payload is about a
+    /// third larger. Applies to every image entering the pipeline: channel
+    /// attachments, tool outputs that surface local image paths, and the web
+    /// dashboard upload. Defaults to the 20 MiB ceiling that
+    /// [`MultimodalConfig::effective_limits`] clamps to, so an ordinary photo
+    /// is accepted without configuration; lower it to bound per-turn upload
+    /// cost or gateway buffering.
+    ///
+    /// Providers apply their own limits on top of this one. Anthropic refuses a
+    /// single image over 10 MB base64-encoded (about 7.5 MiB decoded), enforced
+    /// by its provider client independently of this setting.
     #[serde(default = "default_multimodal_max_image_size_mb")]
     pub max_image_size_mb: usize,
     /// Maximum age of images in conversation turns.
@@ -6576,11 +7034,18 @@ fn default_multimodal_max_images() -> usize {
 }
 
 fn default_multimodal_max_image_size_mb() -> usize {
-    5
+    20
 }
 
 impl MultimodalConfig {
     /// Clamp configured values to safe runtime bounds.
+    ///
+    /// The 20 MiB image ceiling is the lowest common per-image or per-request
+    /// bound across the supported vision APIs (OpenAI accepts about 20 MB per
+    /// image, Gemini 20 MB for an inline request, Anthropic 32 MB per request
+    /// with a tighter per-image limit its own client enforces). Images are
+    /// buffered whole and grow by about a third under base64, so the ceiling
+    /// also bounds gateway memory per upload.
     pub fn effective_limits(&self) -> (usize, usize) {
         let max_images = self.max_images.clamp(1, 16);
         let max_image_size_mb = self.max_image_size_mb.clamp(1, 20);
@@ -7193,6 +7658,13 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_websocket_ping_interval_secs")]
     pub websocket_ping_interval_secs: u64,
 
+    /// Pairing-code generation policy (`[gateway.pairing_code]`). The one
+    /// source of truth for the length and character family of every code
+    /// the gateway issues.
+    #[serde(default)]
+    #[nested]
+    pub pairing_code: PairingCodePolicy,
+
     /// Pairing dashboard configuration
     #[serde(default)]
     #[nested]
@@ -7312,6 +7784,7 @@ impl Default for GatewayConfig {
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
+            pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
@@ -7324,13 +7797,17 @@ impl Default for GatewayConfig {
 }
 
 /// Pairing dashboard configuration (`[gateway.pairing_dashboard]`).
+///
+/// Code length and character family are **not** configured here. The
+/// dashboard pairing flow issues its codes through the same
+/// [`PairingGuard`](crate::pairing::PairingGuard) as startup pairing and
+/// `zeroclaw gateway get-paircode`, so it consumes
+/// [`gateway.pairing_code`](crate::pairing::PairingCodePolicy) rather than
+/// carrying a second, dashboard-only setting.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gateway.pairing_dashboard"]
 pub struct PairingDashboardConfig {
-    /// Length of pairing codes (default: 8)
-    #[serde(default = "default_pairing_code_length")]
-    pub code_length: usize,
     /// Time-to-live for pending pairing codes in seconds (default: 3600)
     #[serde(default = "default_pairing_ttl")]
     pub code_ttl_secs: u64,
@@ -7345,9 +7822,6 @@ pub struct PairingDashboardConfig {
     pub lockout_secs: u64,
 }
 
-fn default_pairing_code_length() -> usize {
-    8
-}
 fn default_pairing_ttl() -> u64 {
     3600
 }
@@ -7364,7 +7838,6 @@ fn default_pairing_lockout_secs() -> u64 {
 impl Default for PairingDashboardConfig {
     fn default() -> Self {
         Self {
-            code_length: default_pairing_code_length(),
             code_ttl_secs: default_pairing_ttl(),
             max_pending_codes: default_max_pending_codes(),
             max_failed_attempts: default_max_failed_attempts(),
@@ -8318,7 +8791,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), or "bocha" (Bocha AI, requires API key — Chinese-friendly, <https://open.bochaai.com>)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), "serply" (Google web results, requires API key), or "keenable" (works without a key; a key only lifts rate limits, <https://keenable.ai>)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -8345,6 +8818,24 @@ pub struct WebSearchConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bocha_api_key: Option<String>,
+    /// AnySearch API key (optional if search_provider is `"anysearch"`). Without a key, requests use AnySearch's rate-limited anonymous quota. Obtain at <https://www.anysearch.com/console/api-keys>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub anysearch_api_key: Option<String>,
+    /// Serply API key (required if search_provider is `"serply"`). Obtain at <https://serply.io>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub serply_api_key: Option<String>,
+    /// Keenable Search API key (optional even when search_provider is `"keenable"`: without a key the tool uses the public endpoint, which is rate-limited per client IP; a key lifts those limits). Obtain at <https://keenable.ai>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub keenable_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -8377,6 +8868,9 @@ impl Default for WebSearchConfig {
             tavily_api_key: None,
             jina_api_key: None,
             bocha_api_key: None,
+            anysearch_api_key: None,
+            serply_api_key: None,
+            keenable_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -8732,7 +9226,8 @@ pub struct KnowledgeConfig {
     /// Enable the knowledge graph tool. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Path to the knowledge graph SQLite database.
+    /// Path to the knowledge graph SQLite database. A leading `~` is expanded
+    /// at use time via [`KnowledgeConfig::resolved_db_path`].
     #[serde(default = "default_knowledge_db_path")]
     pub db_path: String,
     /// Maximum number of knowledge nodes. Default: 100000.
@@ -8763,6 +9258,20 @@ impl Default for KnowledgeConfig {
             auto_capture: false,
             suggest_on_query: true,
         }
+    }
+}
+
+impl KnowledgeConfig {
+    /// Resolve `db_path` to a filesystem path, expanding only a leading `~`
+    /// or `~/` as the home directory.
+    ///
+    /// A `~` anywhere else in the path is left intact, so Windows 8.3 short
+    /// names such as `ADMINI~1` survive resolution. This is the single source
+    /// of truth for the knowledge database location. Pure — performs no
+    /// filesystem I/O.
+    #[must_use]
+    pub fn resolved_db_path(&self) -> PathBuf {
+        expand_tilde_path(&self.db_path)
     }
 }
 
@@ -10264,6 +10773,42 @@ impl ProxyConfig {
         }
     }
 
+    /// Apply a selected proxy to a client builder without falling back to
+    /// direct traffic when proxy construction fails.
+    pub fn try_apply_to_reqwest_builder(
+        &self,
+        mut builder: reqwest::ClientBuilder,
+        service_key: &str,
+    ) -> Result<reqwest::ClientBuilder> {
+        if !self.should_apply_to_service(service_key) {
+            return Ok(builder);
+        }
+
+        let no_proxy = self.no_proxy_value();
+
+        if let Some(url) = normalize_proxy_url_option(self.all_proxy.as_deref()) {
+            let proxy = reqwest::Proxy::all(&url)
+                .with_context(|| format!("Invalid all_proxy URL for {service_key}"))?;
+            builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
+        }
+
+        if let Some(url) = normalize_proxy_url_option(self.http_proxy.as_deref()) {
+            let proxy = reqwest::Proxy::http(&url)
+                .with_context(|| format!("Invalid http_proxy URL for {service_key}"))?;
+            builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
+        }
+
+        if let Some(url) = normalize_proxy_url_option(self.https_proxy.as_deref()) {
+            let proxy = reqwest::Proxy::https(&url)
+                .with_context(|| format!("Invalid https_proxy URL for {service_key}"))?;
+            builder = builder.proxy(apply_no_proxy(proxy, no_proxy));
+        }
+
+        Ok(builder)
+    }
+
+    /// Apply a selected proxy to a client builder, preserving the legacy
+    /// best-effort behavior for callers that may fall back to direct traffic.
     pub fn apply_to_reqwest_builder(
         &self,
         mut builder: reqwest::ClientBuilder,
@@ -10915,6 +11460,21 @@ pub fn runtime_proxy_config() -> ProxyConfig {
     runtime_proxy_config_snapshot().1
 }
 
+pub fn try_apply_runtime_proxy_to_builder(
+    builder: reqwest::ClientBuilder,
+    service_key: &str,
+) -> Result<reqwest::ClientBuilder> {
+    let proxy = runtime_proxy_config();
+    if proxy.should_apply_to_service(service_key) {
+        proxy.validate().map_err(|_| {
+            anyhow::Error::msg(format!(
+                "Invalid runtime proxy configuration for {service_key}"
+            ))
+        })?;
+    }
+    proxy.try_apply_to_reqwest_builder(builder, service_key)
+}
+
 pub fn apply_runtime_proxy_to_builder(
     builder: reqwest::ClientBuilder,
     service_key: &str,
@@ -11127,7 +11687,9 @@ fn apply_explicit_proxy_to_builder(
 // handshake.
 
 /// Combined async IO trait for boxed WebSocket transport streams.
+#[cfg(feature = "ws-transport")]
 trait AsyncReadWrite: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+#[cfg(feature = "ws-transport")]
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
 /// A boxed async IO stream used when a WebSocket connection is tunnelled
@@ -11137,8 +11699,10 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> AsyncReadWr
 /// We wrap in a newtype so we can implement `AsyncRead` and `AsyncWrite`
 /// via delegation, since Rust trait objects cannot combine multiple
 /// non-auto traits.
+#[cfg(feature = "ws-transport")]
 pub struct BoxedIo(Box<dyn AsyncReadWrite>);
 
+#[cfg(feature = "ws-transport")]
 impl tokio::io::AsyncRead for BoxedIo {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -11149,6 +11713,7 @@ impl tokio::io::AsyncRead for BoxedIo {
     }
 }
 
+#[cfg(feature = "ws-transport")]
 impl tokio::io::AsyncWrite for BoxedIo {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -11173,15 +11738,18 @@ impl tokio::io::AsyncWrite for BoxedIo {
     }
 }
 
+#[cfg(feature = "ws-transport")]
 impl Unpin for BoxedIo {}
 
 /// Convenience alias for the WebSocket stream returned by the proxy-aware
 /// connect helpers.
+#[cfg(feature = "ws-transport")]
 pub type ProxiedWsStream = tokio_tungstenite::WebSocketStream<BoxedIo>;
 
 /// Resolve the effective proxy URL for a WebSocket connection to the
 /// given `ws_url`, taking into account the per-channel `proxy_url`
 /// override, the runtime proxy config, scope and no_proxy list.
+#[cfg(feature = "ws-transport")]
 fn resolve_ws_proxy_url(
     service_key: &str,
     ws_url: &str,
@@ -11246,6 +11814,7 @@ fn resolve_ws_proxy_url(
 ///
 /// `service_key` is the proxy-service selector (e.g. `"channel.discord"`).
 /// `channel_proxy_url` is the optional per-channel proxy override.
+#[cfg(feature = "ws-transport")]
 pub async fn ws_connect_with_proxy(
     ws_url: &str,
     service_key: &str,
@@ -11345,6 +11914,7 @@ pub async fn ws_connect_with_proxy(
 }
 
 /// Establish a WebSocket connection tunnelled through the given proxy URL.
+#[cfg(feature = "ws-transport")]
 async fn ws_connect_via_proxy(
     ws_url: &str,
     proxy_url: &str,
@@ -11501,6 +12071,7 @@ async fn ws_connect_via_proxy(
 }
 
 /// Find the `\r\n\r\n` boundary marking the end of HTTP headers.
+#[cfg(feature = "ws-transport")]
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
@@ -12853,6 +13424,32 @@ fn default_always_ask() -> Vec<String> {
 }
 
 impl RiskProfileConfig {
+    /// Legacy serialized marker used by older operators to represent an
+    /// explicit deny-all profile before `deny_all_tools` existed.
+    pub const LEGACY_DENY_ALL_TOOLS_SENTINEL: &'static str = "__none__";
+
+    /// Resolve the profile's effective tool allowlist without changing the
+    /// persisted representation. `None` is unrestricted, while `Some([])` is
+    /// explicit deny-all. Mixed legacy sentinel lists retain only real tool
+    /// names.
+    #[must_use]
+    pub fn effective_allowed_tools(&self) -> Option<Vec<String>> {
+        if self.deny_all_tools {
+            return Some(Vec::new());
+        }
+
+        let real = self
+            .allowed_tools
+            .iter()
+            .filter(|name| name.as_str() != Self::LEGACY_DENY_ALL_TOOLS_SENTINEL)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !self.allowed_tools.is_empty() && real.is_empty() {
+            return Some(Vec::new());
+        }
+        (!real.is_empty()).then_some(real)
+    }
+
     /// Merge the built-in default `auto_approve` entries into the current
     /// list, preserving any user-supplied additions.
     pub fn ensure_default_auto_approve(&mut self) {
@@ -12881,6 +13478,13 @@ impl RiskProfileConfig {
             enabled: self.sandbox_enabled,
             backend,
             firejail_args: self.firejail_args.clone(),
+            image: self
+                .sandbox_image
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(default_sandbox_image),
         }
     }
 }
@@ -12905,6 +13509,278 @@ fn is_valid_env_var_name(name: &str) -> bool {
         _ => return false,
     }
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+// ── Inbound authentication & principals (RFC 7141) ──────────────
+
+/// Validates the operator-chosen names used by the auth sections: OIDC
+/// aliases (which become the `oidc.<alias>` provider selection key) and
+/// roster entry names / durable principal ids. Conservative charset so the
+/// composed keys stay unambiguous in logs, TOML paths, and principal ids.
+fn is_valid_auth_section_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    name.len() <= 64 && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+/// One OIDC trust relationship (`[oidc.<alias>]`) — the identity-mapping
+/// half consumed by the shared principal resolver.
+///
+/// The alias is an operator-chosen handle (it appears in logs and audit
+/// attribution as `oidc.<alias>` and selects the provider during the
+/// handshake), never part of principal identity: canonical identity is
+/// keyed by the validated issuer plus token subject, so renaming an alias
+/// cannot re-key principals or link accounts across issuers.
+///
+/// Token-verification settings (validation mode, audience, client secrets,
+/// lifetimes) ship with the OIDC provider slice; this entry carries what
+/// the resolver needs to map verified claims to permission profiles.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "oidc"]
+#[serde(default)]
+pub struct OidcConfig {
+    /// Issuer URL exactly as it appears in validated token `iss` claims
+    /// (e.g. `https://sso.example.com/realms/main`).
+    pub issuer: String,
+    /// Dotted path to the verified claim holding this deployment's
+    /// role/group values (e.g. `realm_access.roles`, `groups`). Must be
+    /// set explicitly: the daemon refuses to guess where grants live in a
+    /// token.
+    pub claim_path: String,
+    /// Maps a claim value found at `claim_path` to a
+    /// `[permission_profiles.<alias>]` name. Claim values with no mapping
+    /// grant nothing; an identity mapping to no profile at all is denied.
+    pub profile_map: HashMap<String, String>,
+    /// Maps a SERVICE client's verified `client_id` to a
+    /// `[permission_profiles.<alias>]` name. Service principals resolve ONLY
+    /// through this map, never `profile_map`, so a machine credential cannot
+    /// inherit a human profile from similarly-named claims. A service
+    /// `client_id` with no entry here is authenticated but entitled to nothing
+    /// (fail closed).
+    #[serde(default)]
+    pub service_profile_map: HashMap<String, String>,
+}
+
+impl OidcConfig {
+    pub fn validate(&self, alias: &str) -> Result<()> {
+        if !is_valid_auth_section_name(alias) {
+            anyhow::bail!(
+                "oidc alias {alias:?} is invalid: expected [A-Za-z0-9][A-Za-z0-9_-]* (max 64 chars)"
+            );
+        }
+        if self.issuer.trim().is_empty() {
+            anyhow::bail!("oidc.{alias}.issuer is required");
+        }
+        // Require TLS for the issuer: the OIDC discovery, JWKS, and
+        // introspection documents fetched from it are trusted to verify
+        // tokens, so a plaintext issuer lets an on-path attacker forge
+        // them (and, for enrollment, capture the client secret). Loopback
+        // is the sole exception, for local IdP development and the test
+        // harness where there is no network to intercept.
+        {
+            // The resolver compares the configured issuer byte-for-byte with
+            // the verified token issuer, so validation must accept exactly the
+            // value that comparison will use: surrounding whitespace would
+            // pass a trimmed URL check here and then never match. OpenID
+            // Connect Discovery §3 also excludes query and fragment components
+            // from an issuer identifier, so a decorated value is rejected
+            // rather than allowed through on its scheme alone.
+            if self.issuer != self.issuer.trim() {
+                anyhow::bail!("oidc.{alias}.issuer must not have surrounding whitespace");
+            }
+            // Parse structurally: a prefix check accepts lookalike hosts like
+            // `http://localhost.attacker.example`. Require https, or http only
+            // when the host is EXACTLY a loopback name (local IdP dev / tests).
+            let issuer = self.issuer.as_str();
+            let url = match url::Url::parse(issuer) {
+                Ok(url) => url,
+                Err(e) => anyhow::bail!("oidc.{alias}.issuer is not a valid URL: {e}"),
+            };
+            if url.query().is_some() || url.fragment().is_some() {
+                anyhow::bail!(
+                    "oidc.{alias}.issuer must not carry a query or fragment: OpenID Connect \
+                     Discovery issuer identifiers exclude them"
+                );
+            }
+            match url.scheme() {
+                "https" => {}
+                "http" => {
+                    let host = url.host_str().unwrap_or_default();
+                    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1");
+                    if !is_loopback {
+                        anyhow::bail!(
+                            "oidc.{alias}.issuer must be an https URL (http is allowed only for \
+                             an exact loopback host: localhost, 127.0.0.1, or ::1)"
+                        );
+                    }
+                }
+                other => anyhow::bail!(
+                    "oidc.{alias}.issuer must be an http(s) URL, got scheme '{other}'"
+                ),
+            }
+        }
+        if self.profile_map.is_empty() && self.service_profile_map.is_empty() {
+            anyhow::bail!(
+                "oidc.{alias} requires profile_map or service_profile_map: map at least one \
+                 verified identity value to a permission profile or every identity from this issuer \
+                 will be denied"
+            );
+        }
+        if !self.profile_map.is_empty() && self.claim_path.trim().is_empty() {
+            anyhow::bail!(
+                "oidc.{alias}.claim_path is required: set the dotted path to the \
+                 claim carrying role/group values (e.g. `realm_access.roles` or `groups`)"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One local roster identity (`[users.<name>]`) for the local auth
+/// providers (peer credentials today; SSH keys and passwords are
+/// separately tracked extensions).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "user"]
+#[serde(default)]
+pub struct UserConfig {
+    /// Durable principal identifier for this entry; defaults to the entry
+    /// name. Ownership of sessions, memory, approvals, and audit trails
+    /// keys on this id, NOT on the entry name — so to rename the entry
+    /// without orphaning its data, set `principal_id` to the original id
+    /// in the same edit. Changing an entry's effective principal id
+    /// creates a new principal that owns nothing.
+    pub principal_id: Option<String>,
+    /// Unix uid accepted for this user over the local socket (peer
+    /// credential). Required today: it is the only roster credential the
+    /// accepted provider set supports.
+    pub uid: Option<u32>,
+    /// The `[permission_profiles.<alias>]` entries granting this user's
+    /// permissions, merged by deterministic union. Required; a user with
+    /// no profile cannot authenticate.
+    pub permission_profiles: Vec<String>,
+}
+
+impl UserConfig {
+    /// The durable principal id this entry resolves to (explicit
+    /// `principal_id`, else the entry name).
+    #[must_use]
+    pub fn effective_principal_id<'a>(&'a self, name: &'a str) -> &'a str {
+        self.principal_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(name)
+    }
+
+    pub fn validate(&self, name: &str) -> Result<()> {
+        if !is_valid_auth_section_name(name) {
+            anyhow::bail!(
+                "users entry name {name:?} is invalid: expected [A-Za-z0-9][A-Za-z0-9_-]* (max 64 chars)"
+            );
+        }
+        if let Some(id) = self.principal_id.as_deref().map(str::trim)
+            && !id.is_empty()
+            && !is_valid_auth_section_name(id)
+        {
+            anyhow::bail!(
+                "users.{name}.principal_id {id:?} is invalid: expected [A-Za-z0-9][A-Za-z0-9_-]* (max 64 chars)"
+            );
+        }
+        if self.uid.is_none() {
+            anyhow::bail!(
+                "users.{name}.uid is required: the peer-credential provider is the only \
+                 supported roster credential today, and an entry with no credential can \
+                 never authenticate"
+            );
+        }
+        if self.permission_profiles.iter().all(|p| p.trim().is_empty()) {
+            anyhow::bail!(
+                "users.{name}.permission_profiles is required: a user with no permission \
+                 profile holds no grants and cannot authenticate"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One named grant set (`[permission_profiles.<alias>]`).
+///
+/// Profiles are the single authorization vocabulary: OIDC `profile_map`
+/// values and `[users.<name>].permission_profiles` both resolve here. A
+/// profile grants exactly what it lists; everything else is denied.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "permission_profile"]
+#[serde(default)]
+pub struct PermissionProfileConfig {
+    /// Grant everything. When true all other fields are irrelevant.
+    pub admin: bool,
+    /// Agent aliases holders of this profile may bind or address. Empty
+    /// grants NO agents; grant every agent with the explicit `"*"` entry.
+    pub allowed_agents: Vec<String>,
+    /// Dotted config path prefixes holders may write. A trailing `.*`
+    /// grants the subtree (e.g. `channels.*`); a bare path grants that
+    /// exact prop; `"*"` grants every path. Empty grants NO paths.
+    pub config_write_paths: Vec<String>,
+    /// Tool names holders may cause an agent to run. Empty grants NO
+    /// tools — broad access requires the explicit `"*"` entry. (Note this
+    /// differs from risk-profile `allowed_tools`, where empty means
+    /// unconstrained: permission profiles are deny-by-default. The
+    /// agent's own risk-profile policy still applies on top.)
+    pub allowed_tools: Vec<String>,
+    /// Resource-class grants: for each resource kind, the verbs
+    /// permitted. Resources: `system`, `sessions`, `memory`, `cron`,
+    /// `config`, `agents`, `cost`, `skills`, `personality`, `logs`,
+    /// `tui`, `files`, `locales`, `quickstart`, `channels`, `providers`,
+    /// `models`, `peer_groups`, `plugins`, `tools`, `sops`. Verbs:
+    /// `create`, `read`, `update`, `delete`, `execute`. An unlisted
+    /// resource is denied.
+    pub grants: HashMap<zeroclaw_api::grants::Resource, Vec<zeroclaw_api::grants::Verb>>,
+}
+
+impl PermissionProfileConfig {
+    /// Compile this profile into the runtime grant shape.
+    #[must_use]
+    pub fn resolve(&self) -> zeroclaw_api::grants::ResolvedGrants {
+        use zeroclaw_api::principal::AgentAlias;
+        let mut resolved = zeroclaw_api::grants::ResolvedGrants::none();
+        resolved.admin = self.admin;
+        // Normalize selectors: trim surrounding whitespace and drop empties.
+        // Validation trims when checking existence, but the compiled selector
+        // must match too, so `" main "` cannot validate and then never match.
+        resolved.allowed_agents = self
+            .allowed_agents
+            .iter()
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .map(|a| AgentAlias(a.to_string()))
+            .collect();
+        resolved.config_write_paths = self
+            .config_write_paths
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        resolved.allowed_tools = self
+            .allowed_tools
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .collect();
+        for (resource, verbs) in &self.grants {
+            resolved
+                .resources
+                .insert(*resource, verbs.iter().copied().collect());
+        }
+        resolved
+    }
 }
 
 // ── Profiles & Bundles ───────────────────────────────────────────
@@ -13113,19 +13989,13 @@ pub struct RiskProfileConfig {
     /// (fail-closed deny under the default `on_no_approver`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_route: Option<crate::autonomy::ApprovalRoute>,
-    /// Tools the agent may call in agentic mode. Empty = inherit / no
-    /// authorization constraint. Authorization decision: which tools is
-    /// the agent permitted to invoke at all. See `excluded_tools` for
-    /// the inverse denylist scoped to non-CLI channels.
-    ///
-    /// The TOML config does not distinguish an omitted field from
-    /// `allowed_tools = []`; both deserialize to `Vec::new()` and
-    /// `SecurityPolicy::from_profiles` maps that to "no authorization
-    /// constraint" at this layer. If you need an explicit deny-all gate,
-    /// apply it on the caller-supplied per-run `allowed_tools` (cron
-    /// jobs and other narrowers pass that list in directly to
-    /// `ToolAccessPolicy`, which honors `Some(vec![])` as deny-all) or
-    /// via `excluded_tools` covering the specific tools you want blocked.
+    /// Tools the agent may call in agentic mode. An omitted field and an
+    /// explicit `allowed_tools = []` are the same legacy state: no
+    /// authorization constraint (unrestricted). A non-empty list is an
+    /// explicit closed set for built-ins and MCP; skill tools remain
+    /// registered unless listed in `excluded_tools`. For an explicit
+    /// deny-all gate, set [`Self::deny_all_tools`] — an empty list does
+    /// NOT mean deny-all.
     ///
     /// MCP exception: when the list is non-empty, runtime-discovered MCP
     /// tools (any name containing `__`, which is the `<server>__<tool>`
@@ -13142,6 +14012,14 @@ pub struct RiskProfileConfig {
     /// will not see runtime-discovered MCP tools unless it names them.
     ///
     pub allowed_tools: Vec<String>,
+    /// Explicit deny-all for this profile: no tool may be invoked under it
+    /// (built-ins, MCP tools, and skill-defined tools alike — there is no
+    /// `__` auto-admit under deny-all). `allowed_tools = []` remains
+    /// legacy-unrestricted; setting both `deny_all_tools = true` and a
+    /// non-empty `allowed_tools` is a configuration error rejected by
+    /// [`Config::validate`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deny_all_tools: bool,
     /// Tools excluded from non-CLI channels under this profile.
     ///
     /// Also subtracts from the agentic-delegate allow-list resolved at
@@ -13167,6 +14045,11 @@ pub struct RiskProfileConfig {
     #[serde(default)]
     #[nested]
     pub sandbox_policy: SandboxPolicyConfig,
+    /// Container image the docker sandbox runs commands in when
+    /// `sandbox_backend = "docker"`. `None` inherits the built-in default.
+    /// Set this to pin a digest or a specific tag so the sandbox stops
+    /// tracking whatever the default tag moves to.
+    pub sandbox_image: Option<String>,
 }
 
 impl Default for RiskProfileConfig {
@@ -13185,11 +14068,13 @@ impl Default for RiskProfileConfig {
             delegation_policy: DelegationPolicy::default(),
             approval_route: None,
             allowed_tools: Vec::new(),
+            deny_all_tools: false,
             excluded_tools: Vec::new(),
             sandbox_enabled: None,
             sandbox_backend: None,
             firejail_args: Vec::new(),
             sandbox_policy: SandboxPolicyConfig::default(),
+            sandbox_image: None,
         }
     }
 }
@@ -13237,8 +14122,17 @@ pub struct RuntimeProfileConfig {
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
     /// Maximum conversation history messages retained per session. `None` inherits.
     pub max_history_messages: Option<usize>,
-    /// Maximum estimated tokens for context before compaction. `None` inherits.
+    /// Maximum estimated tokens before proactive history trimming. `None`
+    /// preserves the legacy 32,000-token default when `context_compact_ratio`
+    /// is unset. In ratio mode this remains an optional downward cap. Every
+    /// positive effective value is capped by the selected model capacity. `0`
+    /// disables proactive token-budget trimming.
     pub max_context_tokens: Option<usize>,
+    /// Opt-in fraction of the selected model's context window at which
+    /// proactive history trimming triggers (e.g. `0.9` = trim at 90%). `None`
+    /// preserves the legacy absolute-budget behavior. Values outside `(0, 1]`
+    /// are treated as unset.
+    pub context_compact_ratio: Option<f64>,
     /// Use compact bootstrap (6000 chars / 2 RAG chunks). `None` inherits.
     pub compact_context: Option<bool>,
     /// Enable parallel tool execution per iteration. `None` inherits.
@@ -13293,6 +14187,7 @@ impl Default for RuntimeProfileConfig {
             agentic_timeout_secs: None,
             max_history_messages: None,
             max_context_tokens: None,
+            context_compact_ratio: None,
             compact_context: None,
             parallel_tools: None,
             tool_dispatcher: None,
@@ -15026,7 +15921,14 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
-    /// Send the response as multiple separate messages at paragraph boundaries.
+    /// Send the response as multiple separate messages. The boundary between
+    /// messages is channel-specific (for example, Telegram splits at completed
+    /// agent turns).
+    ///
+    /// On Telegram, narration streamed for a text-default peer is delivered as
+    /// separate, permanent text messages. A per-turn voice route
+    /// (`send_via(modality = "voice")`) therefore applies to the final reply
+    /// only — it does not convert or retract narration already sent this turn.
     #[serde(rename = "multi_message")]
     MultiMessage,
 }
@@ -15134,8 +16036,12 @@ fn default_draft_update_interval_ms() -> u64 {
     1000
 }
 
+/// Default pacing between consecutive messages in MultiMessage stream mode.
+/// Channel constructors must reference this instead of duplicating the value.
+pub const DEFAULT_MULTI_MESSAGE_DELAY_MS: u64 = 800;
+
 fn default_multi_message_delay_ms() -> u64 {
-    800
+    DEFAULT_MULTI_MESSAGE_DELAY_MS
 }
 
 fn default_telegram_approval_timeout_secs() -> u64 {
@@ -15207,6 +16113,13 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Minimum delay (ms) between successive multi_message narration messages
+    /// (and before the approval prompt) for one recipient. Does not apply to the
+    /// fixed pacing between physical fragments of a single over-4096-character
+    /// message. Only used when `stream_mode = "multi_message"`.
+    #[tab(Behavior)]
+    #[serde(default = "default_multi_message_delay_ms")]
+    pub multi_message_delay_ms: u64,
     /// Inbound message debounce window in milliseconds for this Telegram alias.
     /// When set, overrides the global `[channels].debounce_ms` for this channel
     /// only. `0` or unset falls back to the global value.
@@ -15223,6 +16136,43 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// When `true` (default), group-chat sessions key on the sender, so
+    /// distinct members of the same group (or forum topic) each get an
+    /// isolated conversation context (matches the existing behavior). When
+    /// `false`, all members of a group chat share one session scoped to the
+    /// chat (and forum topic, when present), so the agent keeps full
+    /// conversation context regardless of which member writes. Sharing the
+    /// session shares its session-scoped controls too: any member's `/new`
+    /// resets the shared history for the whole group/topic, and a member's
+    /// session-level `/model` route override applies to everyone in it,
+    /// while `/stop` and message debouncing stay personal to each sender.
+    /// 1-on-1 chats are unaffected (chat_id is already unique per user-bot
+    /// pair).
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub per_user_session: bool,
+    /// When true in Telegram group chats, unaddressed messages that pass
+    /// sender/chat authorization are recorded as passive conversation context
+    /// without starting an agent turn. Lets the bot follow the discussion and
+    /// answer with full context when later @-mentioned. Default: `false`.
+    ///
+    /// Recording passive messages requires `mention_only = true`: with the
+    /// default `mention_only = false` the bot already answers every
+    /// authorized group message, so no unaddressed message is left to record.
+    ///
+    /// Shared history is not gated that way. Enabling this flag puts every
+    /// group/topic message on one shared session, the way
+    /// `per_user_session = false` does, whatever `mention_only` says and
+    /// whatever `per_user_session` says, because an observation filed in the
+    /// observed member's own session could never answer the participant who
+    /// later @-mentions the bot. Members therefore share conversation
+    /// context and the session-scoped controls that come with it, so any
+    /// member's `/new` resets the history for the whole group/topic.
+    /// Scheduling stays personal: message debouncing, `/stop` and
+    /// interruption still key on the sender.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub passive_group_context: bool,
     /// Override for the top-level `ack_reactions` setting. When `None`, the
     /// channel falls back to `[channels].ack_reactions`. When set
     /// explicitly, it takes precedence.
@@ -15266,8 +16216,11 @@ impl Default for TelegramConfig {
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: default_draft_update_interval_ms(),
+            multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            per_user_session: true,
+            passive_group_context: false,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -15721,7 +16674,14 @@ pub enum MattermostListenMode {
 }
 
 /// Mattermost bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived, for the same reason as
+/// [`DiscordConfig`]: a derived `Default` zeroes every field, which disagrees
+/// with the serde defaults, and for `approval_timeout_secs` that disagreement
+/// is load-bearing. `0` is an already-elapsed deadline, so an alias built in
+/// Rust would deny every approval while an alias parsed from a file waits the
+/// documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.mattermost"]
 pub struct MattermostConfig {
@@ -15825,6 +16785,55 @@ pub struct MattermostConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+    /// Seconds to wait for operator approval on `always_ask` tools before
+    /// auto-denying. Mattermost prompts by posting a token-prefixed message and
+    /// reading the operator's reply, so this budget covers a human noticing the
+    /// post and typing back.
+    #[tab(Behavior)]
+    #[serde(default = "default_channel_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// Inject each room's Mattermost channel purpose into the system prompt as
+    /// channel-supplied context, letting one room specialise the agent.
+    ///
+    /// Off by default, because enabling it is a trust decision: the purpose is
+    /// editable by anyone holding `manage_*_channel_properties`, which on
+    /// default permission schemes is every channel member, and the text reaches
+    /// the system prompt. Those editors can therefore steer the agent in that
+    /// room, including with text that reads as an instruction, and they need
+    /// not be authorized ZeroClaw peers.
+    ///
+    /// What that steering cannot do is exceed the agent's existing permissions:
+    /// prompt text grants no tool, widens no peer group, and changes no
+    /// autonomy level. Enable this only where the room's editors are trusted
+    /// with the agent's configured capabilities.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub purpose_as_instructions: bool,
+}
+
+impl Default for MattermostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            bot_token: None,
+            login_id: None,
+            password: None,
+            channel_ids: Vec::new(),
+            team_ids: Vec::new(),
+            discover_dms: None,
+            thread_replies: None,
+            mention_only: None,
+            interrupt_on_new_message: false,
+            proxy_url: None,
+            listen_mode: MattermostListenMode::default(),
+            excluded_tools: Vec::new(),
+            reply_min_interval_secs: 0,
+            reply_queue_depth_max: 0,
+            approval_timeout_secs: default_channel_approval_timeout_secs(),
+            purpose_as_instructions: false,
+        }
+    }
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -18244,6 +19253,23 @@ pub struct SandboxConfig {
     /// Custom Firejail arguments (when backend = firejail)
     #[serde(default)]
     pub firejail_args: Vec<String>,
+
+    /// Container image the Docker sandbox runs commands in (when backend =
+    /// docker). Pin a digest or a specific tag if you need the sandbox to stop
+    /// tracking upstream changes to the default tag.
+    #[serde(default = "default_sandbox_image")]
+    pub image: String,
+}
+
+/// Default container image for the Docker sandbox backend.
+///
+/// The single source for this value: the serde default below and
+/// `DockerSandbox`'s own default both read it, so a change here cannot leave
+/// one path on a stale image.
+pub const DEFAULT_SANDBOX_IMAGE: &str = "alpine:latest";
+
+fn default_sandbox_image() -> String {
+    DEFAULT_SANDBOX_IMAGE.to_string()
 }
 
 impl Default for SandboxConfig {
@@ -18252,6 +19278,7 @@ impl Default for SandboxConfig {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            image: default_sandbox_image(),
         }
     }
 }
@@ -19577,6 +20604,9 @@ impl Default for Config {
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
@@ -20992,6 +22022,7 @@ impl Config {
         let mut warnings = Vec::new();
         self.collect_codex_cli_extra_arg_warnings(&mut warnings);
         self.collect_fallback_warnings(&mut warnings);
+        self.collect_server_fallback_model_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
@@ -21498,6 +22529,46 @@ impl Config {
         }
     }
 
+    /// Surface `server_fallback_models` entries the Anthropic request builder
+    /// drops before sending: blank entries and entries that duplicate the
+    /// alias's primary `model` (the requested model can never be its own
+    /// server-side fallback target). This is the Anthropic-only sibling of
+    /// [`Self::collect_fallback_model_warnings`], which iterates the flattened
+    /// `base` and cannot see this typed-slot field. The empty-entry check runs
+    /// even when the alias configures no primary `model`; only the
+    /// duplicates-primary check is gated on a primary being set.
+    fn collect_server_fallback_model_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (alias, cfg) in &self.providers.models.anthropic {
+            let primary = cfg.base.model.as_deref();
+            for (i, model) in cfg.server_fallback_models.iter().enumerate() {
+                let path =
+                    format!("providers.models.anthropic.{alias}.server_fallback_models[{i}]");
+                if model.trim().is_empty() {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        crate::validation_warnings::EMPTY_SERVER_FALLBACK_MODEL,
+                        format!(
+                            "server_fallback_models entry {i} on anthropic.{alias} is empty; \
+                             it is dropped before the request is sent"
+                        ),
+                        path,
+                    ));
+                } else if primary == Some(model.as_str()) {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        crate::validation_warnings::SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY,
+                        format!(
+                            "server_fallback_models entry {model:?} on anthropic.{alias} \
+                             duplicates the primary model; it is dropped before the request is sent"
+                        ),
+                        path,
+                    ));
+                }
+            }
+        }
+    }
+
     fn walk_fallback(
         &self,
         from: &str,
@@ -21704,6 +22775,20 @@ impl Config {
                 InvalidNumericRange,
                 path,
                 "{path} = {websocket_ping_interval_secs} is out of range; must be 0..={GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS}"
+            );
+        }
+
+        // Pairing-code policy. Rejected at load rather than clamped
+        // at generation, so an operator who asks for a weak pairing code is
+        // told, not silently given a different one.
+        let pairing_code_length = self.gateway.pairing_code.length;
+        if self.gateway.pairing_code.validate().is_err() {
+            let path = "gateway.pairing_code.length";
+            validation_bail!(
+                InvalidNumericRange,
+                path,
+                "{path} = {pairing_code_length} is out of range; must be \
+                 {PAIRING_CODE_MIN_LENGTH}..={PAIRING_CODE_MAX_LENGTH}"
             );
         }
 
@@ -22165,6 +23250,118 @@ impl Config {
                     anyhow::bail!(
                         "risk_profiles.{profile_alias}.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
                     );
+                }
+            }
+            // `deny_all_tools` is the explicit deny-all gate; `allowed_tools = []`
+            // stays legacy-unrestricted. Combining the flag with a non-empty
+            // allowlist is contradictory — reject it instead of silently
+            // preferring one side.
+            if profile.deny_all_tools && !profile.allowed_tools.is_empty() {
+                anyhow::bail!(
+                    "risk_profiles.{profile_alias}.deny_all_tools cannot be combined with a non-empty allowed_tools list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
+                );
+            }
+        }
+
+        // Inbound authentication & principals (RFC 7141): each auth section
+        // must be internally valid, reference only configured entries, and
+        // map credentials and principal ids unambiguously. Keys are sorted
+        // so the first error reported is deterministic.
+        {
+            let mut oidc_aliases: Vec<&String> = self.oidc.keys().collect();
+            oidc_aliases.sort();
+            for alias in oidc_aliases {
+                let oidc = &self.oidc[alias];
+                oidc.validate(alias)?;
+                let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
+                claim_values.sort();
+                for claim_value in claim_values {
+                    let profile = &oidc.profile_map[claim_value];
+                    if !self.permission_profiles.contains_key(profile) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("oidc.{alias}.profile_map"),
+                            "oidc.{alias}.profile_map[{claim_value:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
+                        );
+                    }
+                }
+                // Service mappings reference profiles too: a dangling target
+                // must fail here at load time, not surface later as a
+                // Misconfigured denial when the service first resolves.
+                let mut client_ids: Vec<&String> = oidc.service_profile_map.keys().collect();
+                client_ids.sort();
+                for client_id in client_ids {
+                    let profile = &oidc.service_profile_map[client_id];
+                    if !self.permission_profiles.contains_key(profile) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("oidc.{alias}.service_profile_map"),
+                            "oidc.{alias}.service_profile_map[{client_id:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
+                        );
+                    }
+                }
+            }
+
+            let mut user_names: Vec<&String> = self.users.keys().collect();
+            user_names.sort();
+            let mut uid_owners: HashMap<u32, &str> = HashMap::new();
+            let mut principal_owners: HashMap<&str, &str> = HashMap::new();
+            for name in user_names {
+                let user = &self.users[name];
+                user.validate(name)?;
+                for profile in &user.permission_profiles {
+                    let trimmed = profile.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if !self.permission_profiles.contains_key(trimmed) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("users.{name}.permission_profiles"),
+                            "users.{name}.permission_profiles names {trimmed:?} but [permission_profiles.{trimmed}] is not configured",
+                        );
+                    }
+                }
+                // A uid maps a kernel-reported peer to exactly one
+                // principal; two entries claiming one uid would make
+                // authentication ambiguous.
+                if let Some(uid) = user.uid
+                    && let Some(other) = uid_owners.insert(uid, name.as_str())
+                {
+                    validation_bail!(
+                        ValidationFailed,
+                        format!("users.{name}.uid"),
+                        "users.{name}.uid = {uid} is already mapped by users.{other}; a uid must resolve to exactly one principal",
+                    );
+                }
+                // Two entries resolving to one durable principal id would
+                // silently link accounts and merge their owned data.
+                let principal_id = user.effective_principal_id(name);
+                if let Some(other) = principal_owners.insert(principal_id, name.as_str()) {
+                    validation_bail!(
+                        ValidationFailed,
+                        format!("users.{name}.principal_id"),
+                        "users.{name} resolves to principal id {principal_id:?} which users.{other} already uses; principal ids must be unique",
+                    );
+                }
+            }
+
+            let mut profile_aliases: Vec<&String> = self.permission_profiles.keys().collect();
+            profile_aliases.sort();
+            for alias in profile_aliases {
+                let profile = &self.permission_profiles[alias];
+                for agent in &profile.allowed_agents {
+                    let trimmed = agent.trim();
+                    if trimmed.is_empty() || trimmed == "*" {
+                        continue;
+                    }
+                    if !self.agents.contains_key(trimmed) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("permission_profiles.{alias}.allowed_agents"),
+                            "permission_profiles.{alias}.allowed_agents names {trimmed:?} but [agents.{trimmed}] is not configured (use \"*\" for every agent)",
+                        );
+                    }
                 }
             }
         }
@@ -23227,14 +24424,36 @@ impl Config {
                 }
             }
 
-            // workspace.read_memory_from: every alias must exist as a
-            // configured agent and must use the same MemoryBackendKind
-            // as the declaring agent. Mismatched backends fail at
-            // config load rather than producing a runtime error when
-            // the per-agent memory plumbing consumes the allowlist.
+            // workspace.read_memory_from: every grant must name a configured
+            // agent, use the same MemoryBackendKind as the declaring agent,
+            // and appear at most once. Legacy string grants are unrestricted;
+            // structured grants may carry an exact category allowlist. An
+            // explicitly empty category list is invalid rather than silently
+            // becoming unrestricted. Mismatched backends fail at config load
+            // rather than producing a runtime error when the per-agent memory
+            // plumbing consumes the allowlist.
             let agent_backend = agent.memory.backend;
+            let mut seen_memory_grants: std::collections::BTreeSet<&str> =
+                std::collections::BTreeSet::new();
             for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
                 let target_str = target.as_str();
+                if target
+                    .categories()
+                    .is_some_and(|categories| categories.is_empty())
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                        "agents.{alias}.workspace.read_memory_from[{i}].categories must contain at least one category when present",
+                    );
+                }
+                if !seen_memory_grants.insert(target_str) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].agent"),
+                        "agents.{alias}.workspace.read_memory_from[{i}].agent = {target_str:?} duplicates an earlier memory grant; combine categories into one grant",
+                    );
+                }
                 if target_str == alias.as_str() {
                     validation_bail!(
                         InvalidFormat,
@@ -23249,6 +24468,18 @@ impl Config {
                         "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
                     );
                 };
+                if target.categories().is_some()
+                    && matches!(
+                        agent_backend,
+                        crate::multi_agent::MemoryBackendKind::Markdown
+                    )
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                        "agents.{alias}.workspace.read_memory_from[{i}] uses a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution",
+                    );
+                }
                 if target_agent.memory.backend != agent_backend {
                     let target_backend = target_agent.memory.backend;
                     validation_bail!(
@@ -25436,6 +26667,18 @@ impl HasPropKind for serde_json::Value {
 #[cfg(test)]
 mod tests {
 
+    #[::core::prelude::v1::test]
+    fn cache_passthrough_deserializes_and_defaults_to_omitted() {
+        let enabled: ModelProviderConfig = toml::from_str("cache_passthrough = true").unwrap();
+        assert!(enabled.cache_passthrough);
+
+        let serialized = toml::to_string(&ModelProviderConfig::default()).unwrap();
+        assert!(
+            !serialized.contains("cache_passthrough"),
+            "default cache_passthrough must be omitted from serialized config"
+        );
+    }
+
     // ── Nextcloud Talk: one normalized bot secret for both directions ──
     //
     // Nextcloud installs ONE secret per bot and uses it to verify inbound webhook
@@ -25527,6 +26770,150 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn effective_context_budget_preserves_legacy_default_and_zero_sentinel() {
+        use super::{ModelContextWindowSource, ResolvedRuntime};
+
+        // Ratio is opt-in: a large model keeps the established 32k default.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 32_000);
+
+        // Opting in to a ratio scales against the selected model window.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            context_compact_ratio: Some(0.8),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 160_000);
+
+        // An explicit ceiling clamps ratio mode down.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            max_context_tokens: Some(50_000),
+            context_compact_ratio: Some(0.8),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 50_000);
+
+        // Invalid ratio behaves as unset and therefore preserves 32k.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            context_compact_ratio: Some(0.0),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 32_000);
+
+        // Explicit zero remains the proactive-trimming disable sentinel.
+        let r = ResolvedRuntime {
+            model_context_window: 200_000,
+            max_context_tokens: Some(0),
+            context_compact_ratio: Some(0.9),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 0);
+
+        // The historical 32k input budget is clamped to the selected model's
+        // smaller capacity.
+        let r = ResolvedRuntime {
+            model_context_window: 8_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 8_000);
+
+        // An explicit absolute budget is also bounded by capacity when ratio
+        // mode is off.
+        let r = ResolvedRuntime {
+            model_context_window: 8_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            max_context_tokens: Some(128_000),
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 8_000);
+
+        // A pruning threshold remains a downward cap and can never raise the
+        // effective budget above model capacity.
+        let r = ResolvedRuntime {
+            model_context_window: 8_000,
+            model_context_window_source: ModelContextWindowSource::Configured,
+            history_pruning: crate::scattered_types::HistoryPrunerConfig {
+                enabled: true,
+                max_tokens: 12_000,
+                ..crate::scattered_types::HistoryPrunerConfig::default()
+            },
+            ..ResolvedRuntime::default()
+        };
+        assert_eq!(r.effective_context_budget(), 8_000);
+    }
+
+    #[::core::prelude::v1::test]
+    fn context_limits_follow_selected_provider_alias_and_model() {
+        use std::collections::HashMap;
+
+        use super::{
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RuntimeProfileConfig,
+        };
+
+        let mut providers = HashMap::new();
+        for (alias, model, context_window) in [
+            ("large", "large-model", 200_000),
+            ("small", "small-model", 8_000),
+        ] {
+            providers.insert(
+                alias.to_string(),
+                CustomModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        context_window: Some(context_window),
+                        ..ModelProviderConfig::default()
+                    },
+                },
+            );
+        }
+
+        let mut cfg = Config::default();
+        cfg.providers.models.custom = providers;
+        cfg.runtime_profiles.insert(
+            "ratio".to_string(),
+            RuntimeProfileConfig {
+                context_compact_ratio: Some(0.9),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        cfg.agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "ratio".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let large = cfg.resolved_context_limits_for_route("coder", "custom.large", "large-model");
+        assert_eq!(large.model_context_window, 200_000);
+        assert_eq!(
+            large.model_context_window_source,
+            super::ModelContextWindowSource::Configured
+        );
+        assert_eq!(large.context_token_budget, 180_000);
+
+        let small = cfg.resolved_context_limits_for_route("coder", "custom.small", "small-model");
+        assert_eq!(small.model_context_window, 8_000);
+        assert_eq!(small.context_token_budget, 7_200);
+
+        let unknown_override =
+            cfg.resolved_context_limits_for_route("coder", "custom.large", "different-model");
+        assert_eq!(unknown_override.model_context_window, 32_000);
+        assert_eq!(
+            unknown_override.model_context_window_source,
+            super::ModelContextWindowSource::CompatibilityFallback
+        );
+        assert_eq!(unknown_override.context_token_budget, 28_800);
+    }
+
     /// The whole point of splitting the accessor: an operator-facing caller
     /// must be able to tell "unconfigured" from a real 32,000, which a bare
     /// `usize` cannot express.
@@ -25931,6 +27318,390 @@ mod tests {
         assert_eq!(AmqpConfig::default().dispatch, SopDispatch::AgentLoop);
     }
 
+    // ── Inbound auth config sections (RFC 7141 stage 2) ─────────────
+
+    fn auth_operator_profile() -> PermissionProfileConfig {
+        PermissionProfileConfig {
+            allowed_agents: vec!["*".to_string()],
+            allowed_tools: vec!["calculator".to_string()],
+            grants: HashMap::from([(
+                zeroclaw_api::grants::Resource::Sessions,
+                vec![
+                    zeroclaw_api::grants::Verb::Create,
+                    zeroclaw_api::grants::Verb::Read,
+                ],
+            )]),
+            ..PermissionProfileConfig::default()
+        }
+    }
+
+    fn auth_config() -> Config {
+        let mut config = Config::default();
+        config
+            .permission_profiles
+            .insert("operator".to_string(), auth_operator_profile());
+        config.users.insert(
+            "alice".to_string(),
+            UserConfig {
+                uid: Some(1000),
+                permission_profiles: vec!["operator".to_string()],
+                ..UserConfig::default()
+            },
+        );
+        config.oidc.insert(
+            "corp".to_string(),
+            OidcConfig {
+                issuer: "https://sso.example.com/realms/main".to_string(),
+                claim_path: "realm_access.roles".to_string(),
+                profile_map: HashMap::from([(
+                    "zeroclaw-operators".to_string(),
+                    "operator".to_string(),
+                )]),
+                ..OidcConfig::default()
+            },
+        );
+        config
+    }
+
+    #[::core::prelude::v1::test]
+    fn auth_sections_valid_config_passes_validation() {
+        auth_config().validate().expect("valid auth config");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_dangling_profile_map_reference_fails() {
+        let mut config = auth_config();
+        config
+            .oidc
+            .get_mut("corp")
+            .unwrap()
+            .profile_map
+            .insert("admins".to_string(), "missing".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("oidc.corp.profile_map"), "got: {err}");
+        assert!(err.contains("missing"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_dangling_service_profile_map_reference_fails() {
+        // A dangling service target must fail at validation, not surface
+        // later as a Misconfigured denial when the service first resolves.
+        let mut config = auth_config();
+        config
+            .oidc
+            .get_mut("corp")
+            .unwrap()
+            .service_profile_map
+            .insert("worker".to_string(), "missing".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("oidc.corp.service_profile_map"), "got: {err}");
+        assert!(err.contains("missing"), "got: {err}");
+
+        // A service mapping that names a configured profile round-trips.
+        let mut config = auth_config();
+        let existing = config.oidc["corp"]
+            .profile_map
+            .values()
+            .next()
+            .cloned()
+            .expect("auth_config maps at least one claim value");
+        config
+            .oidc
+            .get_mut("corp")
+            .unwrap()
+            .service_profile_map
+            .insert("worker".to_string(), existing);
+        config
+            .validate()
+            .expect("a service map naming a configured profile is valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_service_only_profile_map_does_not_require_a_claim_path() {
+        let mut config = auth_config();
+        let oidc = config.oidc.get_mut("corp").unwrap();
+        oidc.claim_path.clear();
+        oidc.profile_map.clear();
+        oidc.service_profile_map
+            .insert("worker".to_string(), "operator".to_string());
+
+        config
+            .validate()
+            .expect("a service-only OIDC map naming a configured profile is valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_requires_a_human_or_service_profile_map() {
+        let mut config = auth_config();
+        let oidc = config.oidc.get_mut("corp").unwrap();
+        oidc.profile_map.clear();
+        oidc.service_profile_map.clear();
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("profile_map"), "got: {err}");
+        assert!(err.contains("service_profile_map"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_requires_issuer_claim_path_and_profile_map() {
+        for strip in ["issuer", "claim_path", "profile_map"] {
+            let mut config = auth_config();
+            let oidc = config.oidc.get_mut("corp").unwrap();
+            match strip {
+                "issuer" => oidc.issuer.clear(),
+                "claim_path" => oidc.claim_path.clear(),
+                _ => oidc.profile_map.clear(),
+            }
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(strip),
+                "stripping {strip} must fail, got: {err}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_issuer_must_be_https_except_loopback() {
+        // Plaintext issuer over the network is rejected: discovery/JWKS/
+        // introspection are the token-verification root of trust.
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().issuer = "http://sso.corp".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("https"),
+            "http issuer must be refused, got: {err}"
+        );
+
+        // Loopback stays allowed for local IdP dev and the test harness.
+        for loopback in [
+            "http://127.0.0.1:8080/realms/main",
+            "http://localhost:8080",
+            "http://[::1]:8080",
+        ] {
+            let mut ok = auth_config();
+            ok.oidc.get_mut("corp").unwrap().issuer = loopback.to_string();
+            assert!(
+                ok.validate().is_ok(),
+                "loopback issuer {loopback} must be accepted"
+            );
+        }
+
+        // Lookalike hosts must NOT count as loopback: the url::Url parse
+        // (vs a string prefix) rejects these cleartext issuers.
+        for lookalike in [
+            "http://localhost.attacker.example/realms/main",
+            "http://127.0.0.1.attacker.example",
+            "http://not-localhost:8080",
+            "ftp://sso.corp",
+        ] {
+            let mut bad = auth_config();
+            bad.oidc.get_mut("corp").unwrap().issuer = lookalike.to_string();
+            assert!(
+                bad.validate().is_err(),
+                "lookalike/invalid issuer {lookalike} must be rejected"
+            );
+        }
+
+        // The resolver compares the configured issuer byte-for-byte with the
+        // verified token issuer, so validation must accept exactly that value:
+        // surrounding whitespace would pass a trimmed check and then never
+        // match. OpenID Connect Discovery excludes query and fragment from an
+        // issuer identifier, so decorated values are refused too.
+        for decorated in [
+            " https://sso.example.com ",
+            "https://sso.example.com ",
+            "https://sso.example.com?tenant=x",
+            "https://sso.example.com#fragment",
+        ] {
+            let mut bad = auth_config();
+            bad.oidc.get_mut("corp").unwrap().issuer = decorated.to_string();
+            assert!(
+                bad.validate().is_err(),
+                "issuer {decorated:?} with whitespace/query/fragment must be rejected"
+            );
+        }
+        let mut clean = auth_config();
+        clean.oidc.get_mut("corp").unwrap().issuer = "https://sso.example.com".to_string();
+        assert!(
+            clean.validate().is_ok(),
+            "a plain https issuer must still be accepted"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn permission_profile_resolve_normalizes_agent_selectors() {
+        // A whitespace-padded selector must normalize so it actually matches
+        // (`" main "` validated but never matched before); empties are dropped.
+        let profile = PermissionProfileConfig {
+            allowed_agents: vec![" main ".to_string(), "   ".to_string()],
+            ..PermissionProfileConfig::default()
+        };
+        let resolved = profile.resolve();
+        assert!(
+            resolved.may_use_agent("main"),
+            "trimmed selector must match"
+        );
+        assert_eq!(resolved.allowed_agents.len(), 1, "whitespace-only dropped");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_alias_charset_is_enforced() {
+        let mut config = auth_config();
+        let entry = config.oidc.remove("corp").unwrap();
+        config.oidc.insert("bad.alias".to_string(), entry);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("bad.alias"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_dangling_profile_reference_fails() {
+        let mut config = auth_config();
+        config
+            .users
+            .get_mut("alice")
+            .unwrap()
+            .permission_profiles
+            .push("missing".to_string());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("users.alice.permission_profiles"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_without_uid_fail_closed_at_load() {
+        let mut config = auth_config();
+        config.users.get_mut("alice").unwrap().uid = None;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("users.alice.uid"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_duplicate_uid_is_ambiguous_and_fails() {
+        let mut config = auth_config();
+        config.users.insert(
+            "bob".to_string(),
+            UserConfig {
+                uid: Some(1000),
+                permission_profiles: vec!["operator".to_string()],
+                ..UserConfig::default()
+            },
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("uid must resolve to exactly one principal")
+                || err.contains("already mapped"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_duplicate_principal_id_fails() {
+        // An explicit principal_id colliding with another entry's effective
+        // id would silently link two accounts and merge their owned data.
+        let mut config = auth_config();
+        config.users.insert(
+            "bob".to_string(),
+            UserConfig {
+                principal_id: Some("alice".to_string()),
+                uid: Some(2000),
+                permission_profiles: vec!["operator".to_string()],
+            },
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("principal ids must be unique"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn users_rename_with_pinned_principal_id_is_stable() {
+        let mut config = auth_config();
+        let mut entry = config.users.remove("alice").unwrap();
+        entry.principal_id = Some("alice".to_string());
+        config.users.insert("alice-renamed".to_string(), entry);
+        config.validate().expect("rename with pinned id is valid");
+        assert_eq!(
+            config.users["alice-renamed"].effective_principal_id("alice-renamed"),
+            "alice",
+            "the durable principal id survives the display rename"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn permission_profile_allowed_agents_must_exist_or_be_wildcard() {
+        let mut config = auth_config();
+        config
+            .permission_profiles
+            .get_mut("operator")
+            .unwrap()
+            .allowed_agents = vec!["ghost".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("permission_profiles.operator.allowed_agents"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn permission_profile_resolves_to_deny_by_default_grants() {
+        use zeroclaw_api::grants::{Resource, Verb};
+        let resolved = auth_operator_profile().resolve();
+        assert!(!resolved.admin);
+        assert!(resolved.permits(Resource::Sessions, Verb::Read));
+        assert!(!resolved.permits(Resource::Sessions, Verb::Delete));
+        assert!(!resolved.permits(Resource::Config, Verb::Update));
+        assert!(resolved.may_use_agent("anything"), "wildcard entry");
+        assert!(resolved.may_use_tool("calculator"));
+        assert!(!resolved.may_use_tool("shell"), "selector is an allowlist");
+        assert!(
+            !resolved.may_write_config("channels.discord"),
+            "empty config paths grant nothing"
+        );
+
+        let empty = PermissionProfileConfig::default().resolve();
+        assert!(
+            !empty.may_use_tool("calculator"),
+            "empty profile grants nothing"
+        );
+        assert!(!empty.permits(Resource::System, Verb::Read));
+    }
+
+    #[::core::prelude::v1::test]
+    fn auth_sections_roundtrip_from_toml() {
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+allowed_tools = ["calculator"]
+
+[permission_profiles.operator.grants]
+sessions = ["create", "read"]
+tools = ["execute"]
+
+[users.alice]
+uid = 1000
+permission_profiles = ["operator"]
+
+[oidc.corp]
+issuer = "https://sso.example.com/realms/main"
+claim_path = "realm_access.roles"
+
+[oidc.corp.profile_map]
+zeroclaw-operators = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("auth sections parse");
+        config.validate().expect("parsed auth config validates");
+        let resolved = config.permission_profiles["operator"].resolve();
+        assert!(resolved.permits(
+            zeroclaw_api::grants::Resource::Tools,
+            zeroclaw_api::grants::Verb::Execute
+        ));
+        assert_eq!(
+            config.oidc["corp"].profile_map["zeroclaw-operators"],
+            "operator"
+        );
+        assert_eq!(config.users["alice"].uid, Some(1000));
+    }
+
     #[test]
     async fn filesystem_validate_requires_path() {
         let cfg = FilesystemConfig {
@@ -26132,6 +27903,46 @@ mod tests {
         if std::env::var("HOME").is_ok() {
             assert!(!resolved.to_string_lossy().starts_with('~'));
             assert!(resolved.ends_with(".zeroclaw/plugins"));
+        }
+    }
+
+    // ── Knowledge db path resolution ──────────────────────────
+
+    #[test]
+    async fn resolved_db_path_passes_absolute_path_through() {
+        let cfg = KnowledgeConfig {
+            db_path: "/srv/zeroclaw/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_db_path(),
+            PathBuf::from("/srv/zeroclaw/knowledge.db")
+        );
+    }
+
+    #[test]
+    async fn resolved_db_path_preserves_non_prefix_tilde() {
+        // Windows 8.3 short names contain a `~` that is not a home shortcut.
+        let cfg = KnowledgeConfig {
+            db_path: "/tmp/ADMINI~1/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        assert_eq!(
+            cfg.resolved_db_path(),
+            PathBuf::from("/tmp/ADMINI~1/knowledge.db")
+        );
+    }
+
+    #[test]
+    async fn resolved_db_path_expands_leading_tilde() {
+        let cfg = KnowledgeConfig {
+            db_path: "~/.zeroclaw/knowledge.db".to_string(),
+            ..KnowledgeConfig::default()
+        };
+        let resolved = cfg.resolved_db_path();
+        if std::env::var("HOME").is_ok() {
+            assert!(!resolved.to_string_lossy().starts_with('~'));
+            assert!(resolved.ends_with(".zeroclaw/knowledge.db"));
         }
     }
 
@@ -26559,6 +28370,33 @@ untrusted_outbound_redact = false
             .or_default()
             .ensure_default_auto_approve();
         config
+    }
+
+    #[test]
+    async fn multimodal_defaults_sit_at_the_effective_ceiling() {
+        // The default is deliberately the clamp ceiling: an operator who never
+        // configures `[multimodal]` should be able to send an ordinary photo.
+        // If either number moves, move it here too rather than incidentally.
+        let cfg = MultimodalConfig::default();
+        assert_eq!(cfg.max_image_size_mb, 20);
+        assert_eq!(cfg.effective_limits(), (4, 20));
+    }
+
+    #[test]
+    async fn multimodal_effective_limits_clamp_out_of_range_values() {
+        let cfg = MultimodalConfig {
+            max_images: 99,
+            max_image_size_mb: 512,
+            ..MultimodalConfig::default()
+        };
+        assert_eq!(cfg.effective_limits(), (16, 20));
+
+        let cfg = MultimodalConfig {
+            max_images: 0,
+            max_image_size_mb: 0,
+            ..MultimodalConfig::default()
+        };
+        assert_eq!(cfg.effective_limits(), (1, 1));
     }
 
     #[test]
@@ -26997,6 +28835,177 @@ enabled = true
         config
             .validate()
             .expect("WebSocket ping interval upper bound must validate");
+    }
+
+    // ── Pairing-code policy ──────────────────────────
+
+    /// The shipped default is the strong policy, not the six-digit code.
+    #[test]
+    async fn gateway_default_pairing_code_policy_is_the_strong_default() {
+        let config = Config::default();
+        assert_eq!(config.gateway.pairing_code, PairingCodePolicy::default());
+        assert_eq!(config.gateway.pairing_code.length, 32);
+        assert_eq!(
+            config.gateway.pairing_code.charset,
+            crate::pairing::PairingCodeCharset::Alphanumeric
+        );
+    }
+
+    #[test]
+    async fn gateway_pairing_code_section_parses_from_toml() {
+        let config: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 24\ncharset = \"unambiguous\"\n")
+                .expect("pairing-code section parses");
+        assert_eq!(config.gateway.pairing_code.length, 24);
+        assert_eq!(
+            config.gateway.pairing_code.charset,
+            crate::pairing::PairingCodeCharset::Unambiguous
+        );
+        config.validate().expect("24 unambiguous chars is valid");
+    }
+
+    #[test]
+    async fn validate_rejects_pairing_code_length_below_minimum() {
+        let mut config = Config::default();
+        config.gateway.pairing_code.length = PAIRING_CODE_MIN_LENGTH - 1;
+
+        let err = config
+            .validate()
+            .expect_err("a pairing code weaker than the old default must be rejected");
+
+        assert!(
+            err.to_string().contains("gateway.pairing_code.length"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_pairing_code_length_above_maximum() {
+        let mut config = Config::default();
+        config.gateway.pairing_code.length = PAIRING_CODE_MAX_LENGTH + 1;
+
+        let err = config
+            .validate()
+            .expect_err("an over-long pairing code must be rejected");
+
+        assert!(
+            err.to_string().contains("gateway.pairing_code.length"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_pairing_code_length_bounds() {
+        for length in [PAIRING_CODE_MIN_LENGTH, PAIRING_CODE_MAX_LENGTH] {
+            let mut config = Config::default();
+            config.gateway.pairing_code.length = length;
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("documented bound {length} must validate: {e}"));
+        }
+    }
+
+    /// The dashboard consumes the shared policy instead of carrying
+    /// its own length knob. A config that still names the retired
+    /// `gateway.pairing_dashboard.code_length` must load, must not resurrect
+    /// a parallel setting, and must leave `[gateway.pairing_code]` in charge.
+    #[test]
+    async fn retired_dashboard_code_length_is_not_a_parallel_setting() {
+        let config: Config = toml::from_str(
+            "[gateway.pairing_dashboard]\n\
+             code_length = 8\n\
+             code_ttl_secs = 3600\n\
+             \n\
+             [gateway.pairing_code]\n\
+             length = 20\n\
+             charset = \"unambiguous\"\n",
+        )
+        .expect("a config carrying the retired key must still load");
+
+        // The shared policy is the only thing that decides code shape.
+        assert_eq!(config.gateway.pairing_code.length, 20);
+        assert_eq!(
+            config.gateway.pairing_code.charset,
+            crate::pairing::PairingCodeCharset::Unambiguous
+        );
+        // The dashboard section survives with its remaining fields.
+        assert_eq!(config.gateway.pairing_dashboard.code_ttl_secs, 3600);
+
+        // No settable property anywhere still offers a second code length.
+        let code_length_props: Vec<String> = config
+            .prop_fields()
+            .into_iter()
+            .map(|f| f.name)
+            .filter(|name| name.starts_with("gateway.") && name.ends_with("code_length"))
+            .collect();
+        assert!(
+            code_length_props.is_empty(),
+            "a parallel pairing-code length setting reappeared: {code_length_props:?}"
+        );
+
+        // And exactly one pairing-code length property exists overall.
+        let length_props: Vec<String> = config
+            .prop_fields()
+            .into_iter()
+            .map(|f| f.name)
+            .filter(|name| name.starts_with("gateway.pairing"))
+            .filter(|name| name.contains("length"))
+            .collect();
+        assert_eq!(
+            length_props,
+            vec!["gateway.pairing_code.length".to_string()],
+            "there must be exactly one pairing-code length setting"
+        );
+    }
+
+    /// The dashboard/API pairing flow and startup pairing must agree,
+    /// because both resolve the same `[gateway.pairing_code]` value.
+    #[test]
+    async fn dashboard_and_startup_pairing_share_one_policy() {
+        let config: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 12\ncharset = \"numeric\"\n")
+                .expect("parses");
+        let guard = crate::pairing::PairingGuard::new(true, &[], config.gateway.pairing_code);
+
+        // Startup code (what the banner prints).
+        let startup = guard.pairing_code().expect("startup code");
+        // Dashboard code (`POST /api/pairing/initiate`) — the gateway
+        // re-reads live config for this argument on every mint.
+        let dashboard = guard
+            .generate_new_pairing_code(config.gateway.pairing_code)
+            .expect("dashboard code");
+
+        for code in [&startup, &dashboard] {
+            assert_eq!(code.len(), 12, "code {code} must follow the config");
+            assert!(code.chars().all(|c| c.is_ascii_digit()));
+        }
+    }
+
+    /// Review MAJOR-1, config half: strengthening `[gateway.pairing_code]`
+    /// changes what the *same* guard mints, with no reconstruction. Mirrors
+    /// how the gateway swaps the whole `Config` on a config write.
+    #[test]
+    async fn a_strengthened_policy_applies_without_rebuilding_the_guard() {
+        let weak: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 6\ncharset = \"numeric\"\n")
+                .expect("parses");
+        let guard = crate::pairing::PairingGuard::new(true, &[], weak.gateway.pairing_code);
+        assert_eq!(guard.pairing_code().expect("startup code").len(), 6);
+
+        // Operator edits config; the gateway replaces the whole Config.
+        let strong: Config =
+            toml::from_str("[gateway.pairing_code]\nlength = 28\ncharset = \"unambiguous\"\n")
+                .expect("parses");
+        let minted = guard
+            .generate_new_pairing_code(strong.gateway.pairing_code)
+            .expect("mint under the new policy");
+
+        assert_eq!(minted.len(), 28, "next code must follow the new policy");
+        let alphabet = strong.gateway.pairing_code.charset.alphabet();
+        assert!(
+            minted.bytes().all(|b| alphabet.contains(&b)),
+            "code {minted} must use the new charset"
+        );
     }
 
     fn plugin_entry_with_egress(hosts: &[&str], private: &[&str]) -> super::PluginEntryConfig {
@@ -28024,6 +30033,7 @@ log_tool_io = "off"
         assert!(a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
         assert!(a.allowed_tools.is_empty());
+        assert!(!a.deny_all_tools);
     }
 
     #[test]
@@ -28496,6 +30506,9 @@ auto_save = true
                 backend: ObservabilityBackend::Log,
                 ..ObservabilityConfig::default()
             },
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             risk_profiles: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -28555,9 +30568,12 @@ auto_save = true
                         api_base_url: default_telegram_api_base_url(),
                         stream_mode: StreamMode::default(),
                         draft_update_interval_ms: default_draft_update_interval_ms(),
+                        multi_message_delay_ms: default_multi_message_delay_ms(),
                         debounce_ms: None,
                         interrupt_on_new_message: false,
                         mention_only: false,
+                        per_user_session: true,
+                        passive_group_context: false,
                         ack_reactions: None,
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -28853,6 +30869,91 @@ auto_approve = []
         }
     }
 
+    /// `allowed_tools = []` keeps its legacy meaning (unrestricted): it does
+    /// not flip the profile to deny-all, and it is not a validation error.
+    #[test]
+    async fn risk_profile_empty_allowed_tools_stays_unrestricted() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+allowed_tools = []
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert!(
+            profile.allowed_tools.is_empty(),
+            "explicit [] must deserialize as the legacy unrestricted state"
+        );
+        assert!(!profile.deny_all_tools);
+        parsed.validate().expect("allowed_tools = [] must validate");
+    }
+
+    #[test]
+    async fn risk_profile_effective_allowed_tools_normalizes_legacy_deny_all_sentinel() {
+        let mut profile = RiskProfileConfig::default();
+        assert_eq!(profile.effective_allowed_tools(), None);
+
+        profile.allowed_tools = vec![RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into()];
+        assert_eq!(profile.effective_allowed_tools(), Some(vec![]));
+
+        profile.allowed_tools = vec![
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+        ];
+        assert_eq!(profile.effective_allowed_tools(), Some(vec![]));
+
+        profile.allowed_tools = vec![
+            RiskProfileConfig::LEGACY_DENY_ALL_TOOLS_SENTINEL.into(),
+            "shell".into(),
+        ];
+        assert_eq!(
+            profile.effective_allowed_tools(),
+            Some(vec!["shell".into()])
+        );
+    }
+
+    /// `deny_all_tools = true` is the explicit deny-all representation and is
+    /// valid on its own.
+    #[test]
+    async fn risk_profile_deny_all_tools_flag_parses_and_validates() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+deny_all_tools = true
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert!(profile.deny_all_tools);
+        parsed
+            .validate()
+            .expect("deny_all_tools = true alone must validate");
+    }
+
+    /// `deny_all_tools = true` combined with a non-empty `allowed_tools` is a
+    /// configuration error and must fail validation loudly instead of one
+    /// side silently winning.
+    #[test]
+    async fn risk_profile_deny_all_tools_with_nonempty_allowed_tools_is_rejected() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+deny_all_tools = true
+allowed_tools = ["shell"]
+"#;
+        let parsed = parse_test_config(raw);
+        let err = parsed
+            .validate()
+            .expect_err("deny_all_tools + non-empty allowed_tools must be rejected");
+        assert!(
+            err.to_string()
+                .contains("risk_profiles.default.deny_all_tools"),
+            "error must name the offending path, got: {err}"
+        );
+    }
+
     /// When no risk_profiles section is provided, defaults are applied to the
     /// synthesized "default" profile.
     #[test]
@@ -29076,6 +31177,58 @@ reasoning_effort = "HIGH"
     }
 
     #[test]
+    async fn sandbox_image_defaults_to_the_shared_constant() {
+        // The default has to come from one place; a second literal anywhere is
+        // how the docs and the sandbox drifted apart before.
+        assert_eq!(SandboxConfig::default().image, DEFAULT_SANDBOX_IMAGE);
+        assert_eq!(DEFAULT_SANDBOX_IMAGE, "alpine:latest");
+    }
+
+    #[test]
+    async fn sandbox_image_is_configurable() {
+        // The sandbox is configured per risk profile, not under a
+        // `[security.sandbox]` table: `SandboxConfig` is a runtime view that
+        // `sandbox_config()` assembles from these flat keys.
+        let raw = r#"
+[risk_profiles.custom]
+sandbox_backend = "docker"
+sandbox_image = "alpine:3.20"
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("config with a sandbox image should parse");
+        let profile = cfg
+            .risk_profiles
+            .get("custom")
+            .expect("the custom profile should deserialize");
+        assert_eq!(profile.sandbox_image.as_deref(), Some("alpine:3.20"));
+        assert_eq!(profile.sandbox_config().image, "alpine:3.20");
+    }
+
+    #[test]
+    async fn sandbox_image_absent_falls_back_to_the_default() {
+        let raw = r#"
+[risk_profiles.custom]
+sandbox_backend = "docker"
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("config without an image should parse");
+        let profile = cfg.risk_profiles.get("custom").expect("profile");
+        assert_eq!(profile.sandbox_image, None);
+        assert_eq!(profile.sandbox_config().image, DEFAULT_SANDBOX_IMAGE);
+    }
+
+    #[test]
+    async fn sandbox_image_blank_is_treated_as_unset() {
+        // An empty or whitespace value must not hand Docker an empty image
+        // name; it falls back the same way an absent key does.
+        let raw = r#"
+[risk_profiles.custom]
+sandbox_image = "   "
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("config should parse");
+        let profile = cfg.risk_profiles.get("custom").expect("profile");
+        assert_eq!(profile.sandbox_config().image, DEFAULT_SANDBOX_IMAGE);
+    }
+
+    #[tokio::test]
     async fn runtime_reasoning_effort_rejects_invalid_values() {
         let raw = r#"
 default_temperature = 0.7
@@ -29496,6 +31649,7 @@ default_temperature = 0.7
                     model: Some("claude-sonnet-4".into()),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         config.save().await.unwrap();
@@ -29596,6 +31750,9 @@ default_temperature = 0.7
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            oidc: HashMap::new(),
+            users: HashMap::new(),
+            permission_profiles: HashMap::new(),
             runtime_profiles: HashMap::new(),
             skill_bundles: HashMap::new(),
             knowledge_bundles: HashMap::new(),
@@ -29687,6 +31844,7 @@ default_temperature = 0.7
                     )]),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -29694,6 +31852,7 @@ default_temperature = 0.7
         config.browser.computer_use.api_key = Some("browser-credential".into());
         config.web_search.brave_api_key = Some("brave-credential".into());
         config.web_search.tavily_api_key = Some("tavily-credential".into());
+        config.web_search.anysearch_api_key = Some("anysearch-credential".into());
         config.storage.postgres.insert(
             "default".to_string(),
             PostgresStorageConfig {
@@ -29807,6 +31966,7 @@ default_temperature = 0.7
             "browser-credential",
             "brave-credential",
             "tavily-credential",
+            "anysearch-credential",
             "postgres://user:pw@host/db",
             "qdrant-credential",
             "rotation-credential-a",
@@ -29880,6 +32040,15 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(tavily_encrypted).unwrap(),
             "tavily-credential"
+        );
+
+        let anysearch_encrypted = stored.web_search.anysearch_api_key.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(
+            anysearch_encrypted
+        ));
+        assert_eq!(
+            store.decrypt(anysearch_encrypted).unwrap(),
+            "anysearch-credential"
         );
 
         let worker_provider = stored
@@ -30090,8 +32259,11 @@ default_temperature = 0.7
             api_base_url: default_telegram_api_base_url(),
             stream_mode: StreamMode::Partial,
             draft_update_interval_ms: 500,
+            multi_message_delay_ms: default_multi_message_delay_ms(),
             interrupt_on_new_message: true,
             mention_only: false,
+            per_user_session: true,
+            passive_group_context: false,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
@@ -30129,6 +32301,19 @@ stream_mode = "single_message"
         .unwrap_err();
 
         assert!(err.to_string().contains("single_message"));
+    }
+
+    #[test]
+    async fn telegram_config_passive_group_context_defaults_off() {
+        let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
+        assert!(!parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn telegram_config_passive_group_context_deserializes_true() {
+        let parsed: TelegramConfig =
+            serde_json::from_str(r#"{"bot_token":"t","passive_group_context":true}"#).unwrap();
+        assert!(parsed.passive_group_context);
     }
 
     #[test]
@@ -31154,6 +33339,7 @@ allowed_numbers = ["+1", "+2"]
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: 30,
+            pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
@@ -31853,6 +34039,7 @@ model = "primary-model"
                     temperature: Some(0.5),
                     ..Default::default()
                 },
+                ..Default::default()
             },
         );
         // ModelProvider fields are now resolved directly — no cache needed.
@@ -33362,6 +35549,70 @@ api_token = "tok"
                 .collect_warnings()
                 .iter()
                 .all(|warning| warning.code != "proxy_conflicts_with_dns_pinned_tools")
+        );
+    }
+
+    #[test]
+    async fn proxy_config_accepts_exact_hailo_model_provider_selector() {
+        let proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.hailo_ollama".into()],
+            ..Default::default()
+        };
+
+        proxy
+            .validate()
+            .expect("canonical Hailo selector validates");
+        assert!(ProxyConfig::supported_service_keys().contains(&"model_provider.hailo_ollama"));
+        assert!(proxy.should_apply_to_service("model_provider.hailo_ollama"));
+        assert!(!proxy.should_apply_to_service("model_provider.ollama"));
+    }
+
+    #[test]
+    async fn selected_invalid_proxy_fails_closed_when_applying_to_a_client_builder() {
+        let proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://[::1".into()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.hailo_ollama".into()],
+            ..Default::default()
+        };
+
+        let error = proxy
+            .try_apply_to_reqwest_builder(reqwest::Client::builder(), "model_provider.hailo_ollama")
+            .expect_err("selected invalid proxy must fail before a direct client is built");
+        assert!(error.to_string().contains("Invalid http_proxy URL"));
+
+        let _ = proxy
+            .try_apply_to_reqwest_builder(reqwest::Client::builder(), "model_provider.ollama")
+            .expect("unselected proxy must not affect another provider");
+    }
+
+    #[test]
+    async fn selected_invalid_runtime_proxy_fails_closed_before_client_construction() {
+        let _env_guard = env_override_lock().await;
+        let previous = runtime_proxy_config();
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://[::1".into()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.hailo_ollama".into()],
+            ..Default::default()
+        });
+
+        let result = try_apply_runtime_proxy_to_builder(
+            reqwest::Client::builder(),
+            "model_provider.hailo_ollama",
+        );
+        set_runtime_proxy_config(previous);
+
+        let error = result.expect_err("selected invalid runtime proxy must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid runtime proxy configuration for model_provider.hailo_ollama")
         );
     }
 
@@ -35837,8 +38088,11 @@ high_entropy_tokens = false
                 api_base_url: default_telegram_api_base_url(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: default_draft_update_interval_ms(),
+                multi_message_delay_ms: default_multi_message_delay_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -41235,7 +43489,9 @@ allowed_users = []
         alpha
             .workspace
             .read_memory_from
-            .push(crate::multi_agent::AgentAlias::new("alpha"));
+            .push(crate::multi_agent::MemoryGrant::Agent(
+                crate::multi_agent::AgentAlias::new("alpha"),
+            ));
         let err = config
             .validate()
             .expect_err("self-reference must fail validation");
@@ -41266,7 +43522,9 @@ allowed_users = []
         alpha
             .workspace
             .read_memory_from
-            .push(crate::multi_agent::AgentAlias::new("beta"));
+            .push(crate::multi_agent::MemoryGrant::Agent(
+                crate::multi_agent::AgentAlias::new("beta"),
+            ));
 
         let err = config
             .validate()
@@ -41275,6 +43533,104 @@ allowed_users = []
         assert!(
             msg.contains("same-backend siblings only"),
             "expected cross-backend explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_empty_memory_grant_categories() {
+        let mut config = multi_agent_test_config();
+        config
+            .agents
+            .get_mut("alpha")
+            .unwrap()
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: crate::multi_agent::AgentAlias::new("beta"),
+                categories: Some(Vec::new()),
+            });
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        let err = config
+            .validate()
+            .expect_err("an explicitly empty category list must fail validation");
+        assert!(
+            err.to_string()
+                .contains("categories must contain at least one category"),
+            "expected empty-category explanation, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_scoped_grants_for_markdown_memory() {
+        let mut config = multi_agent_test_config();
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Markdown,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Markdown;
+        alpha
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: crate::multi_agent::AgentAlias::new("beta"),
+                categories: Some(vec!["core".to_string()]),
+            });
+
+        let err = config
+            .validate()
+            .expect_err("Markdown must fail closed for scoped grants");
+        assert!(
+            err.to_string()
+                .contains("Markdown memory does not preserve per-row categories"),
+            "expected Markdown fail-closed explanation, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_duplicate_memory_grants() {
+        let mut config = multi_agent_test_config();
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        config
+            .agents
+            .get_mut("alpha")
+            .unwrap()
+            .workspace
+            .read_memory_from
+            .extend([
+                crate::multi_agent::MemoryGrant::Agent(crate::multi_agent::AgentAlias::new("beta")),
+                crate::multi_agent::MemoryGrant::Scoped {
+                    agent: crate::multi_agent::AgentAlias::new("beta"),
+                    categories: Some(vec!["core".to_string()]),
+                },
+            ]);
+
+        let err = config
+            .validate()
+            .expect_err("duplicate grants for one source agent must fail validation");
+        assert!(
+            err.to_string()
+                .contains("duplicates an earlier memory grant"),
+            "expected duplicate-grant explanation, got: {err}"
         );
     }
 
@@ -43696,6 +46052,66 @@ group_policy = "all"
             .models
             .openai
             .insert("primary".to_string(), entry);
+
+        assert!(config.collect_warnings().is_empty());
+    }
+
+    #[test]
+    async fn empty_server_fallback_model_warns() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        // No primary `model` configured: the empty-entry check must still fire.
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                server_fallback_models: vec!["".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "empty_server_fallback_model");
+        assert_eq!(
+            warnings[0].path,
+            "providers.models.anthropic.primary.server_fallback_models[0]"
+        );
+    }
+
+    #[test]
+    async fn server_fallback_model_duplicates_primary_warns() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-fable-5".to_string()),
+                    ..Default::default()
+                },
+                server_fallback_models: vec!["claude-fable-5".to_string()],
+            },
+        );
+
+        let warnings = config.collect_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "server_fallback_model_duplicates_primary");
+    }
+
+    #[test]
+    async fn server_fallback_distinct_entries_do_not_warn() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.providers.models.anthropic.insert(
+            "primary".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-fable-5".to_string()),
+                    ..Default::default()
+                },
+                server_fallback_models: vec!["claude-opus-4-8".to_string()],
+            },
+        );
 
         assert!(config.collect_warnings().is_empty());
     }

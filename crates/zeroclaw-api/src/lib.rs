@@ -1,12 +1,15 @@
 //! ZeroClaw API layer — trait definitions and shared types.
 
+pub mod a2a_wire;
 pub mod agent;
 pub mod attribution;
 pub mod channel;
 pub mod elicitation;
+pub mod grants;
 pub mod hook;
 pub mod ingress;
 pub mod jsonrpc;
+pub mod lifecycle;
 pub mod media;
 pub mod memory_traits;
 pub mod model_provider;
@@ -15,6 +18,7 @@ pub mod peripherals_traits;
 pub mod plan;
 pub mod platform;
 pub mod plugin;
+pub mod plugin_key;
 pub mod principal;
 pub mod runtime_status;
 pub mod runtime_traits;
