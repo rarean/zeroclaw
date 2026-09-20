@@ -182,7 +182,7 @@ impl FileEditTool {
         if !self.security.is_resolved_path_allowed(&resolved_target) {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(
                     self.security
                         .resolved_path_violation_message(&resolved_target),

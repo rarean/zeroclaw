@@ -12928,8 +12928,10 @@ fn is_valid_env_var_name(name: &str) -> bool {
 ///    app-layer (`SecurityPolicy::from_profiles`) enforcement consume:
 ///    - `deny_read: None` falls back to the top-level `RiskProfileConfig.forbidden_paths`.
 ///    - `allow_read: None` falls back to the top-level `RiskProfileConfig.allowed_roots`.
-///    - `allow_write: None` falls back to [`DEFAULT_ALLOW_WRITE`] merged with the legacy
-///      `allowed_roots` compat field (unless `workspace_only = true`, which always wins).
+///    - `allow_write: None` with effective `workspace_only = true` scopes the implicit
+///      grant to the workspace root; otherwise `None` falls back to [`DEFAULT_ALLOW_WRITE`]
+///      merged with the legacy `allowed_roots` compat field. An explicit `Some(v)` is
+///      authoritative regardless of `workspace_only`.
 ///    - `deny_write` stays operator-only in the effective inputs; the
 ///      [`MANDATORY_DENY_WRITE`] guardrail list is always active on top of it
 ///      (RFC 6996: no all-or-nothing switch), relaxable per entry via
@@ -13060,10 +13062,16 @@ pub struct RiskProfileConfig {
     /// Autonomy level applied to this profile. Default: `supervised`.
     pub level: AutonomyLevel,
     /// Restrict filesystem access to workspace-relative paths. Default: `false`.
-    /// Compatibility field: the runtime resolver maps `workspace_only = true` into
-    /// `sandbox_policy` by constraining `allow_write` to the workspace root. `workspace_only`
-    /// always takes effect — it overrides any concurrently set `sandbox_policy.allow_write`
-    /// and emits a warning when it does so. Prefer `sandbox_policy.allow_write` for new configs.
+    /// Compatibility field: `workspace_only = true` scopes the IMPLICIT workspace
+    /// read and write grants (preserving the legacy behavior); it does not
+    /// override the canonical `sandbox_policy` lists. An explicit canonical
+    /// `sandbox_policy.allow_write` (including an explicit empty list) is
+    /// authoritative regardless of `workspace_only` — name `"."` in the list to
+    /// keep the workspace writable — and an explicit `sandbox_policy.allow_read`
+    /// is authoritative the same way. `deny_read` and `deny_write` always win
+    /// over any workspace-scoped grant, including the workspace grant itself.
+    /// At `Full` autonomy `workspace_only` is always treated as `false`, with
+    /// `deny_read` still enforced. Prefer `sandbox_policy` for new configs.
     pub workspace_only: bool,
     /// Allowlist of executable names for shell execution.
     pub allowed_commands: Vec<String>,

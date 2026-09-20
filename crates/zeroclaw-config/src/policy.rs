@@ -426,10 +426,39 @@ impl SecurityPolicy {
 
 /// Process-wide latch for the RFC 6996 compat-narrowing warning: one WARN
 /// per risk profile per process, so long-running daemons that rebuild
-/// policies per session do not spam the log on every delegation.
+/// policies per session do not spam the log on every delegation. A
+/// persistent marker under the policy's `data_dir` extends the dedup across
+/// restarts, making the documented "warn once on first start after upgrade"
+/// true for short-lived invocations too.
 static COMPAT_NARROWING_WARNED: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<String>>,
 > = std::sync::OnceLock::new();
+
+/// Directory under the policy's `data_dir` holding one marker file per
+/// risk profile that has already emitted the compat-narrowing warning.
+const COMPAT_NARROWING_MARKER_DIR: &str = "sandbox-compat-warned";
+
+/// Filesystem-safe form of a risk profile name for the warning marker.
+/// Path separators and other pathname-hostile bytes collapse to `_` so a
+/// profile name can never escape the marker directory.
+fn compat_marker_file_name(profile_name: &str) -> String {
+    let sanitized: String = profile_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        "unnamed_profile".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
 
 /// Whether `policy`'s profile was intentionally narrowed by the RFC 6996
 /// compatibility conversion — a non-empty legacy `allowed_roots` under
@@ -443,6 +472,14 @@ fn is_compat_narrowed(policy: &SecurityPolicy) -> bool {
 /// Emit the one-time upgrade warning for a compat-narrowed profile. Returns
 /// whether this call was the first for the profile (i.e. the warning fired),
 /// which keeps the latch unit-testable.
+///
+/// Dedup is two-layered: the process-wide latch covers per-session policy
+/// rebuilds, and a marker file under `<data_dir>/sandbox-compat-warned/`
+/// covers process restarts, so the warning fires once per profile per
+/// UPGRADE rather than once per process. A warning must never block startup:
+/// when the marker cannot be written (read-only data dir, absent data_dir)
+/// the warning still fires this start and the failure to persist is logged
+/// at DEBUG — a repeated warning is the safe failure direction.
 fn warn_once_compat_allowlist_narrowing(policy: &SecurityPolicy) -> bool {
     if !is_compat_narrowed(policy) {
         return false;
@@ -453,21 +490,54 @@ fn warn_once_compat_allowlist_narrowing(policy: &SecurityPolicy) -> bool {
     let mut guard = warned
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !guard.insert(profile_name) {
-        return false;
+    if !guard.contains(&profile_name) {
+        // Not warned in this process: consult the persistent marker. A
+        // present marker means a previous start already warned — record it
+        // in the in-process latch too and stay silent.
+        if let Some(data_dir) = &policy.data_dir {
+            let marker = data_dir
+                .join(COMPAT_NARROWING_MARKER_DIR)
+                .join(compat_marker_file_name(&profile_name));
+            if marker.exists() {
+                guard.insert(profile_name);
+                return false;
+            }
+        }
+        guard.insert(profile_name);
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"risk_profile": policy.risk_profile_name})),
+            "sandbox_policy: legacy allowed_roots now derives a WRITE ALLOWLIST (RFC 6996): \
+             writes outside the workspace, /tmp, and the listed allowed_roots are denied \
+             for this profile; previously writes were unrestricted elsewhere. To restore \
+             the old behavior, remove allowed_roots or set an explicit \
+             sandbox_policy.allow_write."
+        );
+        if let Some(data_dir) = &policy.data_dir {
+            let marker_dir = data_dir.join(COMPAT_NARROWING_MARKER_DIR);
+            let marker = marker_dir.join(compat_marker_file_name(&policy.risk_profile_name));
+            if let Err(e) = std::fs::create_dir_all(&marker_dir)
+                .and_then(|()| std::fs::write(&marker, b"warned\n"))
+            {
+                // Never block startup over bookkeeping; the warning will
+                // simply repeat next start, which is the safe direction.
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "marker": marker.display().to_string(),
+                            "error": e.to_string(),
+                        })),
+                    "sandbox_policy: could not persist the compat-narrowing warning marker"
+                );
+            }
+        }
+        return true;
     }
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-            .with_attrs(::serde_json::json!({"risk_profile": policy.risk_profile_name})),
-        "sandbox_policy: legacy allowed_roots now derives a WRITE ALLOWLIST (RFC 6996): \
-         writes outside the workspace, /tmp, and the listed allowed_roots are denied \
-         for this profile; previously writes were unrestricted elsewhere. To restore \
-         the old behavior, remove allowed_roots or set an explicit \
-         sandbox_policy.allow_write."
-    );
-    true
+    false
 }
 
 /// Default allowed commands for Unix platforms.
@@ -572,6 +642,25 @@ pub(crate) fn default_forbidden_paths() -> Vec<String> {
         "~/.aws".into(),
         "~/.config".into(),
     ]
+}
+
+/// Whether `entry` (a raw `forbidden_paths`/`deny_read` spelling) is one of
+/// the built-in default safety roots rather than an operator-authored denial.
+///
+/// This is what tells a broad default root that merely COINCIDES with the
+/// workspace root (`workspace_dir` set to exactly `/tmp`, matching the default
+/// entry `"/tmp"`) apart from an operator deliberately denying the workspace
+/// itself. The first is a collision the default list creates and must not
+/// blank out the workspace grant; the second is authoritative, since RFC 6996
+/// makes `deny_read` win over every workspace-scoped grant, the workspace
+/// itself included.
+///
+/// An operator who spells a denial exactly like a default entry (`deny_read =
+/// ["/tmp"]` with the workspace at `/tmp`) is indistinguishable from the
+/// collision case and reads as the collision — the default list owns that
+/// spelling. Naming the workspace root by any other spelling denies.
+fn is_default_forbidden_entry(entry: &str) -> bool {
+    default_forbidden_paths().iter().any(|d| d == entry)
 }
 
 /// Default forbidden paths for Windows platforms.
@@ -691,6 +780,43 @@ fn deepest_forbidden_depth(
         }
     }
     best
+}
+
+/// [`deepest_forbidden_depth`], split by entry provenance: the returned pair is
+/// `(operator_depth, default_depth)` — the deepest match among
+/// operator-authored entries and among built-in default safety roots
+/// ([`is_default_forbidden_entry`]).
+///
+/// The two are compared against a grant differently. An operator denial that
+/// TIES the granting root wins: RFC 6996 states write precedence flatly
+/// (`deny_write` overrides `allow_write`, no more-specific-allow exception),
+/// and a tie is not "more specific". A built-in default root that ties LOSES:
+/// [`crate::schema::DEFAULT_ALLOW_WRITE`] and the default safety list both name
+/// `/tmp`, so a tie there is two defaults colliding — or a default root
+/// colliding with an operator grant spelled identically — and resolving it to
+/// deny would silently nullify an explicit `allow_write = ["/tmp"]`, which the
+/// field's own contract says always wins. A default root STRICTLY deeper than
+/// the grant still denies, so `/etc` under a broad grant stays protected.
+fn split_forbidden_depths(
+    forbidden_paths: &[String],
+    expanded: &Path,
+    namespace: PathMatchNamespace,
+) -> (Option<usize>, Option<usize>) {
+    let mut operator: Option<usize> = None;
+    let mut default: Option<usize> = None;
+    for forbidden in forbidden_paths {
+        let forbidden_path = expand_user_path(forbidden);
+        let Some(depth) = namespace_prefix_match_depth(&forbidden_path, expanded, namespace) else {
+            continue;
+        };
+        let slot = if is_default_forbidden_entry(forbidden) {
+            &mut default
+        } else {
+            &mut operator
+        };
+        *slot = Some(slot.map_or(depth, |b: usize| b.max(depth)));
+    }
+    (operator, default)
 }
 
 /// Decide whether a `forbidden_paths` entry should deny a path even though an
@@ -3377,17 +3503,55 @@ impl SecurityPolicy {
     /// Deepest (most specific) forbidden match depth for `resolved`, with each
     /// `forbidden_paths` entry first resolved the same way the read/write gates
     /// resolve it (`resolve_policy_entry`: `~` expansion, then relative entries
-    /// joined onto `workspace_dir`). Unlike the free
-    /// [`deepest_forbidden_depth`] — which compares raw config spellings and so
-    /// cannot see workspace-relative deny entries — this derives depths in the
-    /// exact namespace the gates authorize in. `None` when no entry matches.
+    /// joined onto `workspace_dir`, best-effort canonicalization). Unlike the
+    /// free [`deepest_forbidden_depth`] — which compares raw config spellings
+    /// and so cannot see workspace-relative deny entries — this derives depths
+    /// in the exact namespace the gates authorize in. `None` when no entry
+    /// matches.
+    ///
+    /// A BUILT-IN DEFAULT entry that resolves to exactly the workspace root is
+    /// skipped: a broad default safety root (e.g. `/tmp`) coinciding with the
+    /// workspace is a collision the default list creates, not an operator deny
+    /// competing with the workspace grant — the same carve-out the
+    /// workspace-internal deny pre-pass documents. It still denies paths
+    /// outside the workspace via the general forbidden gate (which does not
+    /// skip it). An OPERATOR-authored entry naming the workspace root is NOT
+    /// skipped: RFC 6996 makes `deny_read` authoritative over every
+    /// workspace-scoped grant, the workspace itself included.
+    fn deepest_resolved_forbidden_depth_within_allow(&self, resolved: &Path) -> Option<usize> {
+        let workspace_root = self
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_dir.clone());
+        let mut best: Option<usize> = None;
+        for forbidden in &self.forbidden_paths {
+            let forbidden_path = resolve_policy_entry(forbidden, &self.workspace_dir);
+            if forbidden_path == workspace_root && is_default_forbidden_entry(forbidden) {
+                continue;
+            }
+            if let Some(depth) = namespace_prefix_match_depth(
+                &forbidden_path,
+                resolved,
+                PathMatchNamespace::Resolved,
+            ) {
+                best = Some(best.map_or(depth, |b| b.max(depth)));
+            }
+        }
+        best
+    }
+
+    /// Deepest resolved forbidden match depth with no carve-outs — used by the
+    /// general (outside-every-allow) forbidden gate, where every entry
+    /// including a workspace-coinciding default root must still count.
     fn deepest_resolved_forbidden_depth(&self, resolved: &Path) -> Option<usize> {
         let mut best: Option<usize> = None;
         for forbidden in &self.forbidden_paths {
             let forbidden_path = resolve_policy_entry(forbidden, &self.workspace_dir);
-            if let Some(depth) =
-                namespace_prefix_match_depth(&forbidden_path, resolved, PathMatchNamespace::Resolved)
-            {
+            if let Some(depth) = namespace_prefix_match_depth(
+                &forbidden_path,
+                resolved,
+                PathMatchNamespace::Resolved,
+            ) {
                 best = Some(best.map_or(depth, |b| b.max(depth)));
             }
         }
@@ -3443,13 +3607,17 @@ impl SecurityPolicy {
         // workspace root itself.
         for forbidden in &self.forbidden_paths {
             let forbidden_path = resolve_policy_entry(forbidden, &self.workspace_dir);
-            // `forbidden_path != workspace_root` excludes the case where a
-            // broad default forbidden root (e.g. `/tmp`) happens to BE the
+            // The equality carve-out excludes the case where a BUILT-IN
+            // DEFAULT forbidden root (e.g. `/tmp`) happens to BE the
             // workspace root itself (a temp-dir-based workspace) — that is
             // not a workspace-relative deny entry, just an external root
             // that coincides with the workspace, and must not shadow the
-            // workspace grant below.
-            if forbidden_path != workspace_root
+            // workspace grant below. An OPERATOR entry naming the workspace
+            // root still denies here: RFC 6996 puts `deny_read` above every
+            // workspace-scoped grant, the workspace itself included.
+            let coincidental_default_root =
+                forbidden_path == workspace_root && is_default_forbidden_entry(forbidden);
+            if !coincidental_default_root
                 && forbidden_path.starts_with(&workspace_root)
                 && resolved.starts_with(&forbidden_path)
             {
@@ -3468,8 +3636,11 @@ impl SecurityPolicy {
             // Deny-before-allow: an explicit `forbidden_paths` entry at least as
             // specific as the allowing root denies reads even inside the
             // workspace or a read allowlist. A broad default forbidden root
-            // (e.g. `/home`) does not override a more specific allowlist entry.
-            let forbidden_depth = self.deepest_resolved_forbidden_depth(resolved);
+            // (e.g. `/home`) does not override a more specific allowlist entry,
+            // and a default root that coincides with the workspace root does
+            // not shadow the workspace grant at all (see
+            // `deepest_resolved_forbidden_depth_within_allow`).
+            let forbidden_depth = self.deepest_resolved_forbidden_depth_within_allow(resolved);
             if forbidden_overrides_allow(forbidden_depth, allow_depth) {
                 return false;
             }
@@ -3487,10 +3658,7 @@ impl SecurityPolicy {
         // outside every explicit allow tier — this is the original
         // "allowlists coexist with broad default forbidden roots" gate,
         // unchanged in position, now just resolved via `resolve_policy_entry`.
-        if self
-            .deepest_resolved_forbidden_depth(resolved)
-            .is_some()
-        {
+        if self.deepest_resolved_forbidden_depth(resolved).is_some() {
             return false;
         }
 
@@ -3666,35 +3834,59 @@ impl SecurityPolicy {
         let workspace_write_implicit = !self.sandbox_inputs.allow_write_is_explicit
             && !self.sandbox_inputs.allow_write_compat_allowlist;
         let mut allow_depth: Option<usize> = None;
-        if workspace_write_implicit {
-            if let Some(depth) =
-                namespace_prefix_match_depth(&workspace_root, resolved, PathMatchNamespace::Resolved)
-            {
-                allow_depth = Some(depth);
-            }
+        if workspace_write_implicit
+            && let Some(depth) = namespace_prefix_match_depth(
+                &workspace_root,
+                resolved,
+                PathMatchNamespace::Resolved,
+            )
+        {
+            allow_depth = Some(depth);
         }
         for root in self
             .allowed_roots
             .iter()
             .chain(self.allowed_roots_write_only.iter())
         {
-            if let Some(depth) = namespace_prefix_match_depth(root, resolved, PathMatchNamespace::Resolved) {
+            // Tier roots are stored as resolved-but-not-canonicalized paths;
+            // the target is fully resolved, so canonicalize the root before
+            // comparing (macOS `/tmp` → `/private/tmp` would otherwise never
+            // match its own writes).
+            let canonical_root = canonicalize_best_effort(root);
+            if let Some(depth) = namespace_prefix_match_depth(
+                &canonical_root,
+                resolved,
+                PathMatchNamespace::Resolved,
+            ) {
                 allow_depth = Some(allow_depth.map_or(depth, |b| b.max(depth)));
             }
         }
 
         if allow_depth.is_some() {
-            // Deny-before-allow: an explicit `forbidden_paths` entry at least as
-            // specific as the allowing root denies even inside the workspace or
-            // an allowed root, preventing symlink escapes and sensitive-directory
-            // access. A broad default forbidden root (e.g. `/home`) does not
-            // override a more specific operator allowlist entry.
-            let forbidden_depth = deepest_forbidden_depth(
+            // Deny-before-allow: a `forbidden_paths` entry at least as
+            // specific as the granting root denies even inside the workspace
+            // or an allowed root, so a nested forbidden subtree stays
+            // write-protected (symlink escapes, sensitive directories). A
+            // broad forbidden root (e.g. `/home`) does not override a more
+            // specific allowlist entry.
+            //
+            // A tie denies for an OPERATOR entry — RFC 6996 states write
+            // precedence flatly, so the write side is never looser than the
+            // read side for an operator denial. A tie loses for a BUILT-IN
+            // DEFAULT root, which is a collision between the default safety
+            // list and the default write roots (both name `/tmp`) rather than
+            // a denial competing with the grant; denying there would nullify
+            // an explicit `allow_write = ["/tmp"]` that the field's contract
+            // says always wins. See `split_forbidden_depths`.
+            let (operator_depth, default_depth) = split_forbidden_depths(
                 &self.forbidden_paths,
                 resolved,
                 PathMatchNamespace::Resolved,
             );
-            if forbidden_overrides_allow(forbidden_depth, allow_depth) {
+            if forbidden_overrides_allow(operator_depth, allow_depth) {
+                return false;
+            }
+            if matches!((default_depth, allow_depth), (Some(f), Some(a)) if f > a) {
                 return false;
             }
             return true;
@@ -4295,18 +4487,24 @@ impl SecurityPolicy {
         if let Some(agent_cfg) = config.agents.get(agent_alias) {
             policy.risk_profile_name = agent_cfg.risk_profile.trim().to_string();
         }
-        // RFC 6996 upgrade boundary: a profile with effective
-        // `workspace_only = false` and a non-empty legacy `allowed_roots` went
-        // from unrestricted writes to a compat-derived write allowlist. Warn
-        // once per process per profile, naming the profile and the restoring
-        // edit, so the narrowing is never silent.
-        warn_once_compat_allowlist_narrowing(&policy);
         policy.config_path = Some(config.config_path.clone());
         // Runtime data dir: same predicate extends there so state files
         // that the gateway constructs with `&config.data_dir`
         // (`webauthn_credentials.json` for WebAuthnManager) are protected
         // from agent overwrites when `data_dir` overlaps an allowed root.
+        //
+        // Assigned BEFORE the compat-narrowing warning below, which reads it
+        // to find its persistent once-per-upgrade marker; with `data_dir`
+        // still `None` the marker would be neither read nor written and the
+        // warning would silently fall back to once-per-process.
         policy.data_dir = Some(config.data_dir.clone());
+        // RFC 6996 upgrade boundary: a profile with effective
+        // `workspace_only = false` and a non-empty legacy `allowed_roots` went
+        // from unrestricted writes to a compat-derived write allowlist. Warn
+        // once per profile per UPGRADE — deduped in-process by a latch and
+        // across restarts by a marker under `data_dir` — naming the profile
+        // and the restoring edit, so the narrowing is never silent.
+        warn_once_compat_allowlist_narrowing(&policy);
 
         policy
             .allowed_roots_read_only
@@ -7252,6 +7450,62 @@ mod tests {
     }
 
     #[test]
+    fn for_agent_persists_the_compat_narrowing_marker_under_data_dir() {
+        // Production wiring for the once-per-UPGRADE warning: `for_agent`
+        // must assign `data_dir` BEFORE it warns, or the marker is neither
+        // read nor written and the dedup silently degrades to once-per-
+        // process. Asserting the marker file exists after a real `for_agent`
+        // call is what catches that ordering regressing.
+        use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let root = std::env::temp_dir().join(format!(
+            "zeroclaw-for-agent-marker-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut cfg = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        // A compat-narrowed profile: effective `workspace_only = false` with
+        // a non-empty legacy `allowed_roots` is exactly the upgrade boundary
+        // the warning exists for.
+        cfg.risk_profiles.insert(
+            "narrowed".into(),
+            RiskProfileConfig {
+                workspace_only: false,
+                allowed_roots: vec!["/extra".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        cfg.agents.insert(
+            "agent_marker".into(),
+            AliasedAgentConfig {
+                risk_profile: "narrowed".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_marker").unwrap();
+        assert_eq!(
+            policy.data_dir.as_deref(),
+            Some(cfg.data_dir.as_path()),
+            "for_agent must carry the runtime data dir onto the policy"
+        );
+        assert!(
+            cfg.data_dir
+                .join("sandbox-compat-warned")
+                .join("narrowed")
+                .exists(),
+            "for_agent must persist the compat-narrowing marker under data_dir"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn for_agent_creates_the_per_agent_workspace_dir() {
         use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
@@ -8613,6 +8867,92 @@ mod tests {
     }
 
     #[test]
+    fn deny_read_more_specific_than_allow_read_blocks() {
+        // RFC precedence, the other direction: `allow_read` overrides
+        // `deny_read` only for a MORE SPECIFIC allowed path. A broad
+        // allow_read around a narrower deny_read must NOT re-open the
+        // denied subtree — the pre-RFC code returned early from the allow
+        // tier and never reached the deny gate, admitting /secret/private.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.allow_read = Some(vec!["/secret".to_string()]);
+        profile.sandbox_policy.deny_read = Some(vec!["/secret/private".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_readable(Path::new("/secret/private/file.txt")),
+            "a deny_read entry at least as deep as the allowing allow_read root must block"
+        );
+        assert!(
+            policy.is_resolved_path_readable(Path::new("/secret/public/file.txt")),
+            "paths under the allow root but outside the denied subtree stay readable"
+        );
+    }
+
+    #[test]
+    fn operator_deny_read_naming_the_workspace_root_blocks() {
+        // RFC 6996: `deny_read` wins over EVERY workspace-scoped grant, the
+        // workspace itself included. An operator entry that resolves to
+        // exactly the workspace root must therefore blank the workspace read
+        // grant, not be waved through as a coincidental default safety root
+        // (the carve-out `is_default_forbidden_entry` guards).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().canonicalize().unwrap();
+        let target = workspace.join("file.txt");
+        std::fs::write(&target, b"x").unwrap();
+
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.deny_read = Some(vec![workspace.display().to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, &workspace);
+
+        assert!(
+            !policy.is_resolved_path_readable(&target),
+            "an operator deny_read naming the workspace root must block reads inside it"
+        );
+    }
+
+    #[test]
+    fn default_forbidden_root_coinciding_with_the_workspace_still_reads() {
+        // The other side of the same carve-out: a workspace rooted AT a
+        // built-in default safety root (`workspace_dir` = `/tmp`, default
+        // entry `"/tmp"`) is a collision the default list creates, not an
+        // operator denial — every read under the workspace stays allowed.
+        let workspace = PathBuf::from("/tmp");
+        if !workspace.exists() {
+            return;
+        }
+        let profile = crate::schema::RiskProfileConfig::default();
+        assert!(
+            profile.forbidden_paths.iter().any(|p| p == "/tmp"),
+            "precondition: the default safety list owns the /tmp spelling"
+        );
+        let policy = SecurityPolicy::from_risk_profile(&profile, &workspace);
+
+        let resolved = workspace.canonicalize().unwrap().join("coincident.txt");
+        assert!(
+            policy.is_resolved_path_readable(&resolved),
+            "a default forbidden root that merely IS the workspace must not shadow the grant"
+        );
+    }
+
+    #[test]
+    fn deny_read_tied_with_allow_read_blocks() {
+        // Equal depth is NOT "more specific": an allow_read entry identical
+        // to a deny_read entry does not override it — the tie resolves to
+        // deny, an explicit "no" at the same boundary holds.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.allow_read = Some(vec!["/tied".to_string()]);
+        profile.sandbox_policy.deny_read = Some(vec!["/tied".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_readable(Path::new("/tied/file.txt")),
+            "an allow_read entry identical to a deny_read entry must not re-open it"
+        );
+    }
+
+    #[test]
     fn sandbox_policy_old_style_and_new_style_produce_equivalent_path_guard_decisions() {
         // Round-trip parity: an old-style config and its sandbox_policy.* equivalent
         // must reach the same app-layer path-guard verdicts, not just the same
@@ -8803,6 +9143,49 @@ mod tests {
              merge, got allowed_roots={:?} write_only={:?}",
             policy.allowed_roots,
             policy.allowed_roots_write_only
+        );
+    }
+
+    #[test]
+    fn operator_deny_tied_with_allow_write_blocks_the_write() {
+        // RFC 6996 states write precedence flatly: `deny_write` overrides
+        // `allow_write`, with no more-specific-allow exception. An
+        // OPERATOR-authored denial spelled exactly like the granting root is
+        // therefore not overridden — a tie denies, matching the read side.
+        // Only a BUILT-IN DEFAULT root loses a tie (see
+        // `explicit_tmp_allow_write_is_honored_by_app_path_guard`, where the
+        // default safety list and the default write roots both name `/tmp`).
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec!["/granted".to_string()]);
+        profile.sandbox_policy.deny_read = Some(vec!["/granted".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/granted/file.txt")),
+            "an operator denial tying the granting root must block the write"
+        );
+    }
+
+    #[test]
+    fn default_forbidden_root_deeper_than_the_grant_still_blocks_the_write() {
+        // The default safety list loses only a TIE. A default root that is
+        // strictly more specific than the grant keeps denying, so a broad
+        // operator `allow_write` cannot open `/etc`.
+        let workspace = Path::new("/workspace");
+        let mut profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        profile.sandbox_policy.allow_write = Some(vec!["/".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/etc/shadow")),
+            "a default forbidden root deeper than the grant must still deny"
         );
     }
 
@@ -9206,6 +9589,76 @@ mod tests {
         );
         assert!(!is_compat_narrowed(&plain));
         assert!(!warn_once_compat_allowlist_narrowing(&plain));
+    }
+
+    #[test]
+    fn compat_narrowing_warning_persists_across_restart() {
+        // The documented contract is "warn once on FIRST START after
+        // upgrade" — not once per process. Two halves, each with a profile
+        // name unique to this test so the process-wide latch (shared by
+        // every test in the binary) cannot mask the marker behavior:
+        //  1. a first start warns AND leaves the marker under data_dir;
+        //  2. a profile whose marker already exists (as a previous start
+        //     would have written it) stays silent on its FIRST call in this
+        //     process — proving the marker, not the latch, suppressed it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = Path::new("/workspace");
+        let profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            allowed_roots: vec!["/extra".to_string()],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+
+        let mut first_start = SecurityPolicy::from_risk_profile(&profile, workspace);
+        first_start.risk_profile_name = "restart-persist-first".to_string();
+        first_start.data_dir = Some(tmp.path().to_path_buf());
+        assert!(
+            warn_once_compat_allowlist_narrowing(&first_start),
+            "first start must warn"
+        );
+        assert!(
+            tmp.path()
+                .join("sandbox-compat-warned")
+                .join("restart-persist-first")
+                .exists(),
+            "first start must persist the marker"
+        );
+
+        // Pre-existing marker, fresh latch entry: silent on first call.
+        let marker_dir = tmp.path().join("sandbox-compat-warned");
+        std::fs::create_dir_all(&marker_dir).unwrap();
+        std::fs::write(marker_dir.join("restart-persist-premarked"), b"warned\n").unwrap();
+        let mut restart = SecurityPolicy::from_risk_profile(&profile, workspace);
+        restart.risk_profile_name = "restart-persist-premarked".to_string();
+        restart.data_dir = Some(tmp.path().to_path_buf());
+        assert!(
+            !warn_once_compat_allowlist_narrowing(&restart),
+            "a start after the marker exists must stay silent"
+        );
+    }
+
+    #[test]
+    fn compat_narrowing_warning_marker_write_failure_still_warns() {
+        // A warning must never block startup: when the marker cannot be
+        // written (here: data_dir names a regular file, so create_dir_all
+        // fails), the warning still fires this start — repeating is the safe
+        // failure direction — and no marker is left behind.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocked = tmp.path().join("not-a-dir");
+        std::fs::write(&blocked, b"file").unwrap();
+        let workspace = Path::new("/workspace");
+        let profile = crate::schema::RiskProfileConfig {
+            workspace_only: false,
+            allowed_roots: vec!["/extra".to_string()],
+            ..crate::schema::RiskProfileConfig::default()
+        };
+        let mut policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+        policy.risk_profile_name = "marker-write-failure-test".to_string();
+        policy.data_dir = Some(blocked);
+        assert!(
+            warn_once_compat_allowlist_narrowing(&policy),
+            "the warning must fire even when the marker cannot persist"
+        );
     }
 
     #[test]

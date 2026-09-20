@@ -881,6 +881,7 @@ mod tests {
 
         let sandbox = create_sandbox(
             &sandbox_cfg,
+            &default_policy(),
             RuntimeKind::Docker,
             None,
             &SandboxExtraRoots::default(),
@@ -1100,7 +1101,13 @@ mod tests {
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, &default_policy(), "", None);
+        let sandbox = create_sandbox(
+            &sandbox_cfg,
+            &default_policy(),
+            RuntimeKind::Cloudflare,
+            None,
+            &SandboxExtraRoots::default(),
+        );
         assert_eq!(sandbox.name(), "none");
     }
 }

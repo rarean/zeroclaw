@@ -253,6 +253,81 @@ impl GitOperationsTool {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    /// Byte-preserving variant of [`Self::run_git_command`] for preflight
+    /// pathset enumeration. The display-facing String runner is lossy by
+    /// design (it renders to users); a preflight must instead authorize the
+    /// EXACT pathnames Git will act on, so it needs the raw bytes to split
+    /// on NUL and decode strictly — a lossy or quoted rendering can turn a
+    /// denied pathname into an authorized-looking sibling.
+    async fn run_git_command_bytes(
+        &self,
+        args: &[&str],
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<Vec<u8>> {
+        let output = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(working_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Git command failed: {stderr}");
+        }
+
+        Ok(output.stdout)
+    }
+
+    /// Decode NUL-delimited `-z` pathset output into exact pathnames.
+    ///
+    /// Every entry must be strict UTF-8 and the stream must end with the
+    /// terminal NUL Git emits; anything else (undecodable bytes, an interior
+    /// empty entry, trailing non-NUL bytes) means the preflight cannot prove
+    /// the pathset, so the caller fails closed instead of guessing which
+    /// pathname Git actually holds. This is the RFC 6996 "validate exact
+    /// read and write targets" boundary: `String::from_utf8_lossy` plus
+    /// newline splitting silently re-authorizes a different path than Git
+    /// will touch when a name is non-UTF-8 or contains a newline (Git
+    /// C-quotes those in non-`-z` output).
+    fn decode_nul_path_list(bytes: &[u8], operation: &str) -> anyhow::Result<Vec<String>> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if *bytes.last().expect("non-empty checked") != 0 {
+            anyhow::bail!(
+                "{operation} blocked: preflight could not prove the affected pathset \
+                 (NUL-delimited git output ended with trailing non-NUL bytes)"
+            );
+        }
+        // Drop the terminal NUL's empty tail; any OTHER empty entry is a
+        // malformed stream, not a pathname.
+        let entries: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
+        let interior = &entries[..entries.len() - 1];
+        let mut paths = Vec::with_capacity(interior.len());
+        for entry in interior {
+            if entry.is_empty() {
+                anyhow::bail!(
+                    "{operation} blocked: preflight could not prove the affected pathset \
+                     (empty entry inside NUL-delimited git output)"
+                );
+            }
+            match std::str::from_utf8(entry) {
+                Ok(path) => paths.push(path.to_string()),
+                Err(_) => {
+                    let lossy = String::from_utf8_lossy(entry).to_string();
+                    anyhow::bail!(
+                        "{operation} blocked: preflight could not prove the affected pathset \
+                         (repository path is not valid UTF-8: {lossy:?}); refusing to authorize \
+                         a pathname that cannot be matched exactly against the policy"
+                    );
+                }
+            }
+        }
+        Ok(paths)
+    }
+
     /// Enumerate the files a `git checkout <branch_name>` would change
     /// relative to `HEAD` and reject the checkout before it runs if any of
     /// them resolve to a `deny_write`-guarded path (e.g. the mandatory
@@ -268,8 +343,8 @@ impl GitOperationsTool {
         working_dir: &std::path::Path,
     ) -> anyhow::Result<()> {
         let diff_output = self
-            .run_git_command(
-                &["diff", "--name-only", "HEAD", branch_name, "--"],
+            .run_git_command_bytes(
+                &["diff", "--name-only", "-z", "HEAD", branch_name, "--"],
                 working_dir,
             )
             .await
@@ -279,9 +354,11 @@ impl GitOperationsTool {
                      '{branch_name}' would overwrite: {e}"
                 ))
             })?;
+        let paths =
+            Self::decode_nul_path_list(&diff_output, &format!("Checkout of '{branch_name}'"))?;
 
         self.ensure_git_paths_allowed(
-            &diff_output,
+            &paths,
             working_dir,
             GitAccess::Write,
             &format!("Checkout of '{branch_name}'"),
@@ -290,19 +367,22 @@ impl GitOperationsTool {
 
     /// Apply the canonical policy to a Git-reported path set before Git runs.
     ///
-    /// `path_list` is newline-separated repository-relative paths exactly as
-    /// `--name-only` output produces them. Every entry is resolved against
-    /// `working_dir` and checked in `mode`; the first denial aborts the whole
-    /// operation rather than letting Git act on the remainder, because a
-    /// partially applied Git command cannot be rolled back from here.
+    /// `paths` are exact repository-relative pathnames, decoded strictly from
+    /// NUL-delimited `-z` output (or enumerated byte-exactly from the
+    /// filesystem) — never from lossy newline parsing, which can authorize a
+    /// different pathname than Git will touch. Every entry is resolved
+    /// against `working_dir` and checked in `mode`; the first denial aborts
+    /// the whole operation rather than letting Git act on the remainder,
+    /// because a partially applied Git command cannot be rolled back from
+    /// here.
     fn ensure_git_paths_allowed(
         &self,
-        path_list: &str,
+        paths: &[String],
         working_dir: &std::path::Path,
         mode: GitAccess,
         operation: &str,
     ) -> anyhow::Result<()> {
-        for relative in path_list.lines().filter(|line| !line.is_empty()) {
+        for relative in paths {
             let candidate = working_dir.join(relative);
             let resolved = zeroclaw_config::policy::canonicalize_best_effort(&candidate);
             let allowed = match mode {
@@ -325,43 +405,41 @@ impl GitOperationsTool {
     ///
     /// Staging copies a file's bytes into the object store, so `add` is a read
     /// of every path it touches even though it never mutates the working tree.
-    /// `--dry-run` is what Git itself would act on, so the pathspec is expanded
-    /// by Git rather than matched textually here. Fails closed on any line that
-    /// does not have the documented `add '<path>'` shape — an unparsed line
-    /// means the affected set cannot be proven safe.
+    /// `git add --dry-run` renders its affected set as quoted display lines —
+    /// a pathname Git would C-quote (newline, quote, backslash, non-UTF-8)
+    /// cannot be recovered exactly from that form, so the pathset is expanded
+    /// by Git itself through NUL-delimited `ls-files` instead: cached,
+    /// modified, deleted, and untracked-not-ignored entries matching the
+    /// pathspec is exactly the set `add` stages content from. Fails closed on
+    /// any entry that is not strict UTF-8.
     async fn preflight_add(
         &self,
         pathspec: &[String],
         working_dir: &std::path::Path,
     ) -> anyhow::Result<()> {
-        let mut args: Vec<&str> = vec!["add", "--dry-run", "--"];
+        let mut args: Vec<&str> = vec![
+            "ls-files",
+            "-z",
+            "--cached",
+            "--modified",
+            "--deleted",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ];
         args.extend(pathspec.iter().map(String::as_str));
 
-        let dry_run = self
-            .run_git_command(&args, working_dir)
+        let listing = self
+            .run_git_command_bytes(&args, working_dir)
             .await
             .map_err(|e| {
                 anyhow::Error::msg(format!(
                     "Add blocked: cannot determine which files it would stage: {e}"
                 ))
             })?;
+        let paths = Self::decode_nul_path_list(&listing, "Add")?;
 
-        let mut affected = String::new();
-        for line in dry_run.lines().filter(|line| !line.is_empty()) {
-            let path = line
-                .strip_prefix("add '")
-                .or_else(|| line.strip_prefix("remove '"))
-                .and_then(|rest| rest.strip_suffix('\''))
-                .ok_or_else(|| {
-                    anyhow::Error::msg(format!(
-                        "Add blocked: cannot interpret the affected path in git output: {line}"
-                    ))
-                })?;
-            affected.push_str(path);
-            affected.push('\n');
-        }
-
-        self.ensure_git_paths_allowed(&affected, working_dir, GitAccess::Read, "Add")
+        self.ensure_git_paths_allowed(&paths, working_dir, GitAccess::Read, "Add")
     }
 
     /// Enumerate the files `git worktree add` would materialize and reject the
@@ -375,7 +453,10 @@ impl GitOperationsTool {
         working_dir: &std::path::Path,
     ) -> anyhow::Result<()> {
         let tree = self
-            .run_git_command(&["ls-tree", "-r", "--name-only", reference], working_dir)
+            .run_git_command_bytes(
+                &["ls-tree", "-r", "--name-only", "-z", reference],
+                working_dir,
+            )
             .await
             .map_err(|e| {
                 anyhow::Error::msg(format!(
@@ -383,8 +464,9 @@ impl GitOperationsTool {
                      materialize: {e}"
                 ))
             })?;
+        let paths = Self::decode_nul_path_list(&tree, "Worktree add")?;
 
-        self.ensure_git_paths_allowed(&tree, target, GitAccess::Write, "Worktree add")
+        self.ensure_git_paths_allowed(&paths, target, GitAccess::Write, "Worktree add")
     }
 
     /// Enumerate everything `git worktree remove` would delete and reject the
@@ -393,9 +475,12 @@ impl GitOperationsTool {
     /// inside would be removed unchecked. Walks the real directory rather than
     /// asking Git, because removal takes the whole tree, not just tracked
     /// files. Symlinks are recorded but never followed, so the walk cannot
-    /// escape the worktree. Fails closed if the tree cannot be enumerated.
+    /// escape the worktree. Every name must be strict UTF-8 — a name that
+    /// cannot be represented exactly cannot be matched against the policy, so
+    /// the operation fails closed. Fails closed if the tree cannot be
+    /// enumerated.
     async fn preflight_worktree_remove(&self, target: &std::path::Path) -> anyhow::Result<()> {
-        let mut affected = String::new();
+        let mut affected: Vec<String> = Vec::new();
         let mut pending = vec![target.to_path_buf()];
 
         while let Some(dir) = pending.pop() {
@@ -418,8 +503,15 @@ impl GitOperationsTool {
                         path.display()
                     ))
                 })?;
-                affected.push_str(&path.to_string_lossy());
-                affected.push('\n');
+                let name = path.to_str().ok_or_else(|| {
+                    anyhow::Error::msg(format!(
+                        "Worktree remove blocked: preflight could not prove the affected \
+                         pathset (path is not valid UTF-8: {:?}); refusing to authorize a \
+                         pathname that cannot be matched exactly against the policy",
+                        path.to_string_lossy()
+                    ))
+                })?;
+                affected.push(name.to_string());
                 if meta.is_dir() {
                     pending.push(path);
                 }
@@ -454,16 +546,16 @@ impl GitOperationsTool {
     /// with `include_untracked`, remove untracked files); `pop` writes the
     /// stashed contents back, including any untracked files the entry was
     /// created with (`git stash push -u`). Both mutation sets come from Git
-    /// itself so the check covers exactly what Git is about to touch.
+    /// itself, NUL-delimited so a pathname Git would C-quote or that is not
+    /// UTF-8 fails the preflight closed instead of authorizing a sibling
+    /// spelling.
     async fn stash_mutation_set(
         &self,
         action: &str,
         include_untracked: bool,
         pathspec: &[String],
         working_dir: &std::path::Path,
-    ) -> anyhow::Result<String> {
-        let mut affected = String::new();
-
+    ) -> anyhow::Result<Vec<String>> {
         if action == "pop" {
             // `stash show` defaults to the most recent entry — the same one
             // `stash pop` restores. `--include-untracked` is required: without
@@ -473,8 +565,8 @@ impl GitOperationsTool {
             // any enumeration error, including Git versions that do not accept
             // the flag.
             let restored = self
-                .run_git_command(
-                    &["stash", "show", "--name-only", "--include-untracked"],
+                .run_git_command_bytes(
+                    &["stash", "show", "--name-only", "--include-untracked", "-z"],
                     working_dir,
                 )
                 .await
@@ -483,32 +575,31 @@ impl GitOperationsTool {
                         "Stash pop blocked: cannot determine which files it would restore: {e}"
                     ))
                 })?;
-            affected.push_str(&restored);
-            return Ok(affected);
+            return Self::decode_nul_path_list(&restored, "Stash pop");
         }
 
-        let mut tracked_args: Vec<&str> = vec!["diff", "--name-only", "HEAD", "--"];
+        let mut tracked_args: Vec<&str> = vec!["diff", "--name-only", "-z", "HEAD", "--"];
         for p in pathspec {
             tracked_args.push(p);
         }
         let tracked = self
-            .run_git_command(&tracked_args, working_dir)
+            .run_git_command_bytes(&tracked_args, working_dir)
             .await
             .map_err(|e| {
                 anyhow::Error::msg(format!(
                     "Stash blocked: cannot determine which tracked files it would revert: {e}"
                 ))
             })?;
-        affected.push_str(&tracked);
+        let mut affected = Self::decode_nul_path_list(&tracked, "Stash")?;
 
         if include_untracked {
             let mut untracked_args: Vec<&str> =
-                vec!["ls-files", "--others", "--exclude-standard", "--"];
+                vec!["ls-files", "--others", "--exclude-standard", "-z", "--"];
             for p in pathspec {
                 untracked_args.push(p);
             }
             let untracked = self
-                .run_git_command(&untracked_args, working_dir)
+                .run_git_command_bytes(&untracked_args, working_dir)
                 .await
                 .map_err(|e| {
                     anyhow::Error::msg(format!(
@@ -516,7 +607,7 @@ impl GitOperationsTool {
                          remove: {e}"
                     ))
                 })?;
-            affected.push_str(&untracked);
+            affected.extend(Self::decode_nul_path_list(&untracked, "Stash")?);
         }
 
         Ok(affected)
@@ -528,8 +619,18 @@ impl GitOperationsTool {
     /// files; it removes stale `<git-common-dir>/worktrees/<name>` metadata
     /// directories, which is why this resolves against the common Git
     /// directory rather than `working_dir` like the other preflights in this
-    /// file. Fails closed if the common Git directory or the dry-run listing
-    /// cannot be determined or parsed.
+    /// file.
+    ///
+    /// `worktree prune --dry-run` renders its removal set as display lines on
+    /// stderr — a format with no NUL-delimited form, so its pathnames cannot
+    /// be proven exact (a name Git would C-quote could authorize a sibling).
+    /// Instead the removal set is enumerated directly from the filesystem:
+    /// every entry under `<common-dir>/worktrees/` whose `gitdir` file is
+    /// missing or points to a missing directory. That is prune's own default
+    /// staleness criterion, and where the two could disagree this errs on the
+    /// deny side (a directory git would keep but this lists is blocked, never
+    /// the reverse). Every name must be strict UTF-8. Fails closed if the
+    /// common Git directory or the administrative tree cannot be read.
     async fn preflight_worktree_prune(&self, working_dir: &std::path::Path) -> anyhow::Result<()> {
         let common_dir = self
             .run_git_command(&["rev-parse", "--git-common-dir"], working_dir)
@@ -546,45 +647,50 @@ impl GitOperationsTool {
             working_dir.join(common_dir)
         };
 
-        // Unlike every other Git subcommand in this file, `worktree prune`'s
-        // dry-run listing goes to stderr, not stdout, even on a successful
-        // (exit 0) run — `run_git_command` only returns stdout, so this
-        // invokes the process directly.
-        let output = tokio::process::Command::new("git")
-            .args(["worktree", "prune", "--dry-run", "--verbose"])
-            .current_dir(working_dir)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .await
-            .map_err(|e| {
+        let admin_root = common_dir.join("worktrees");
+        let mut affected: Vec<String> = Vec::new();
+        let mut entries = match tokio::fs::read_dir(&admin_root).await {
+            Ok(entries) => entries,
+            // No worktrees have ever been registered: prune is a no-op.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "Worktree prune blocked: cannot enumerate '{}': {e}",
+                    admin_root.display()
+                );
+            }
+        };
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            anyhow::Error::msg(format!(
+                "Worktree prune blocked: cannot enumerate '{}': {e}",
+                admin_root.display()
+            ))
+        })? {
+            let path = entry.path();
+            let name = path.to_str().ok_or_else(|| {
                 anyhow::Error::msg(format!(
-                    "Worktree prune blocked: cannot determine which administrative \
-                     directories it would remove: {e}"
+                    "Worktree prune blocked: preflight could not prove the affected pathset \
+                     (administrative path is not valid UTF-8: {:?}); refusing to authorize a \
+                     pathname that cannot be matched exactly against the policy",
+                    path.to_string_lossy()
                 ))
             })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "Worktree prune blocked: cannot determine which administrative directories \
-                 it would remove: {stderr}"
-            );
-        }
-        let dry_run = String::from_utf8_lossy(&output.stderr).to_string();
-
-        let mut affected = String::new();
-        for line in dry_run.lines().filter(|line| !line.is_empty()) {
-            let relative = line
-                .strip_prefix("Removing ")
-                .and_then(|rest| rest.split(':').next())
-                .ok_or_else(|| {
-                    anyhow::Error::msg(format!(
-                        "Worktree prune blocked: cannot interpret the affected path in git \
-                         output: {line}"
-                    ))
-                })?;
-            affected.push_str(relative);
-            affected.push('\n');
+            // Prune's default criterion: the administrative entry is stale
+            // when its `gitdir` pointer is missing, empty, or dangles. A
+            // live worktree's `gitdir` names an existing directory.
+            let gitdir_file = path.join("gitdir");
+            let stale = match tokio::fs::read_to_string(&gitdir_file).await {
+                Ok(pointer) => {
+                    let target = pointer.trim();
+                    target.is_empty() || !std::path::Path::new(target).try_exists().unwrap_or(false)
+                }
+                Err(_) => true,
+            };
+            if stale {
+                affected.push(name.to_string());
+            }
         }
 
         self.ensure_git_paths_allowed(&affected, &common_dir, GitAccess::Write, "Worktree prune")
@@ -663,19 +769,33 @@ impl GitOperationsTool {
 
         // A diff prints file contents, so the requested pathspec has to clear
         // the canonical read policy before Git runs. The pathspec is expanded
-        // by Git itself (`--name-only` over the same arguments) rather than
+        // by Git itself (`--name-only -z` over the same arguments) rather than
         // matched textually, so a glob or directory that selects a denied file
-        // is caught. Fails closed: if the affected read set cannot be
-        // enumerated, the diff is refused rather than run unchecked.
-        let mut enumerate_args = vec!["diff", "--name-only"];
+        // is caught, and NUL-delimited strict decoding means a pathname Git
+        // would C-quote or that is not UTF-8 fails the preflight closed.
+        // Fails closed: if the affected read set cannot be enumerated, the
+        // diff is refused rather than run unchecked.
+        let mut enumerate_args = vec!["diff", "--name-only", "-z"];
         if cached {
             enumerate_args.push("--cached");
         }
         enumerate_args.push("--");
         enumerate_args.push(files);
 
-        let affected = match self.run_git_command(&enumerate_args, working_dir).await {
-            Ok(list) => list,
+        let affected = match self
+            .run_git_command_bytes(&enumerate_args, working_dir)
+            .await
+        {
+            Ok(bytes) => match Self::decode_nul_path_list(&bytes, "Diff") {
+                Ok(list) => list,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            },
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
@@ -2604,6 +2724,247 @@ mod tests {
         assert!(
             !root.join(".env").exists(),
             "a blocked pop must not restore the untracked protected file"
+        );
+    }
+
+    // ── Pathset-identity regressions (NUL-delimited strict decoding) ─────────
+    //
+    // Git C-quotes newline-bearing names in non-`-z` output and cannot
+    // represent non-UTF-8 names in a String at all; a lossy newline parse
+    // authorizes a DIFFERENT pathname than Git acts on. These pin the exact
+    // identity rule across every preflight surface.
+
+    #[tokio::test]
+    async fn stash_push_rejected_when_a_newline_named_denied_file_would_revert() {
+        // A file literally named "a\nb.txt" sits under deny_write. The old
+        // lossy line-split turned Git's quoted single line into two bogus
+        // siblings ("a" and "b.txt") and authorized the stash; the NUL-delimited
+        // preflight must see the exact name and block.
+        let newline_name = "a\nb.txt";
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[newline_name]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(newline_name), "modified").unwrap();
+
+        let tool = deny_write_git_tool(&root, newline_name);
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "push"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash push must be blocked when the exact newline-bearing name is denied"
+        );
+        let error = result.error.unwrap();
+        assert!(
+            error.contains(newline_name),
+            "the denial must name the exact pathname, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(newline_name)).unwrap(),
+            "modified",
+            "a blocked stash must leave the protected file untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkout_rejected_when_a_newline_named_denied_file_would_overwrite() {
+        let newline_name = "a\nb.txt";
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[newline_name]).await;
+        let root = tmp.path().canonicalize().unwrap();
+
+        std::process::Command::new("git")
+            .args(["checkout", "-b", "feature"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(newline_name), "branch-version").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "change on feature"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["checkout", "master"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        let tool = deny_write_git_tool(&root, newline_name);
+        let result = tool
+            .execute(json!({"operation": "checkout", "branch": "feature"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "checkout must be blocked when switching would overwrite the exact newline-bearing \
+             denied name"
+        );
+        let error = result.error.unwrap();
+        assert!(
+            error.contains(newline_name),
+            "the denial must name the exact pathname, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quoted_and_non_ascii_names_round_trip_exactly_through_the_diff_preflight() {
+        // Characters Git C-quotes in line output (quote, backslash) plus
+        // non-ASCII must survive the preflight as the exact name, so a
+        // deny_read on that name is honored and a deny on a LOOKALIKE
+        // spelled-through-lossy-decoding is not needed.
+        let weird = "we\"ird\\name-文件.txt";
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[weird]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(weird), "modified").unwrap();
+
+        let tool = deny_read_git_tool(&root, weird);
+        let result = tool
+            .execute(json!({"operation": "diff", "files": weird}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "diff of a deny_read target whose name Git would C-quote must be refused"
+        );
+        let error = result.error.unwrap();
+        assert!(
+            error.contains(weird),
+            "the denial must name the exact pathname, got: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decode_nul_path_list_fails_closed_on_bad_input() {
+        // Exact-identity decoding rules, exercised without a repository:
+        // strict UTF-8 per entry, terminal NUL required, no interior empty
+        // entries. Each failure must say the pathset could not be proven so
+        // operators can tell identity failure from a policy denial.
+        assert_eq!(
+            GitOperationsTool::decode_nul_path_list(b"ok.txt\0dir/n.txt\0", "Op").unwrap(),
+            vec!["ok.txt".to_string(), "dir/n.txt".to_string()]
+        );
+        assert!(
+            GitOperationsTool::decode_nul_path_list(b"", "Op")
+                .unwrap()
+                .is_empty()
+        );
+
+        let err = GitOperationsTool::decode_nul_path_list(b"ok.txt\0bad\xff.txt\0", "Op")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not valid UTF-8") && err.contains("could not prove"),
+            "undecodable entry must fail closed with the precise reason, got: {err}"
+        );
+
+        let err = GitOperationsTool::decode_nul_path_list(b"ok.txt", "Op")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("trailing non-NUL bytes"),
+            "missing terminal NUL must fail closed, got: {err}"
+        );
+
+        let err = GitOperationsTool::decode_nul_path_list(b"a.txt\0\0b.txt\0", "Op")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("empty entry"),
+            "interior empty entry must fail closed, got: {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn non_utf8_repository_name_fails_the_preflight_closed() {
+        use std::os::unix::ffi::OsStrExt;
+        // A repository path that is not valid UTF-8 cannot be matched exactly
+        // against the policy; the preflight must refuse the operation with a
+        // precise error rather than authorize a lossy rendering of the name.
+        // Linux-only: APFS and several other filesystems reject non-UTF-8
+        // names at creat time, so the fixture cannot be built there; the
+        // decoder rules themselves are covered on every platform by
+        // `decode_nul_path_list_fails_closed_on_bad_input`.
+        let raw_name = std::ffi::OsStr::from_bytes(b"bad\xff.txt");
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::write(root.join(raw_name), "modified").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "add non-utf8 name"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::write(root.join(raw_name), "modified again").unwrap();
+
+        let tool = test_tool(&root);
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "push"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a non-UTF-8 repository name must fail the stash preflight closed"
+        );
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("not valid UTF-8"),
+            "the refusal must say the pathset could not be proven, got: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stash_pop_rejected_when_a_newline_named_untracked_file_is_denied() {
+        // Stash-pop identity: the entry's untracked half carries a
+        // newline-bearing name; the restored-set enumeration must see the
+        // exact name, not two split halves of a quoted line.
+        let newline_name = "a\nb.txt";
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &[]).await;
+        let root = tmp.path().canonicalize().unwrap();
+
+        std::fs::write(root.join(newline_name), "stashed content").unwrap();
+        std::process::Command::new("git")
+            .args(["stash", "push", "-u", "-m", "fixture"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            !root.join(newline_name).exists(),
+            "fixture precondition: the newline-named file must be in the stash"
+        );
+
+        let tool = deny_write_git_tool(&root, newline_name);
+        let result = tool
+            .execute(json!({"operation": "stash", "action": "pop"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "stash pop must be blocked when the entry restores the exact newline-bearing \
+             denied name"
+        );
+        assert!(
+            !root.join(newline_name).exists(),
+            "a blocked pop must not restore the protected file"
         );
     }
 

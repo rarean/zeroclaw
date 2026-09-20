@@ -613,6 +613,63 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn path_guard_read_mode_specific_deny_read_beats_broad_allow_read() {
+        // Execution-level regression for the read-specificity contract
+        // (RFC 6996: "allow_read overrides deny_read for a more specific
+        // allowed path"): a broad allow_read root must NOT re-open a
+        // more-specific deny_read subtree at the registered read-mode
+        // wrapper boundary. The unit contract lives in zeroclaw-config
+        // (`deny_read_more_specific_than_allow_read_blocks`); this proves
+        // the wrapper's own decision path inherits it, not just the method.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("ws");
+        let allow_root = tmp.path().join("secret");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(allow_root.join("private")).unwrap();
+        std::fs::create_dir_all(allow_root.join("public")).unwrap();
+        std::fs::write(allow_root.join("private/file.txt"), "denied").unwrap();
+        std::fs::write(allow_root.join("public/file.txt"), "allowed").unwrap();
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace,
+            allowed_roots: vec![allow_root.clone()],
+            forbidden_paths: vec![allow_root.join("private").to_string_lossy().into_owned()],
+            ..SecurityPolicy::default()
+        });
+        let (inner, counter) = CountingTool::new();
+        let tool = PathGuardedTool::new(inner, sec, PathAccessMode::Read);
+
+        let denied = tool
+            .execute(
+                serde_json::json!({"path": allow_root.join("private/file.txt").to_str().unwrap()}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !denied.success,
+            "a deny_read subtree nested under a broad allow_read root must be refused by the wrapper"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "inner must not be called when the wrapper denies the read"
+        );
+
+        let allowed = tool
+            .execute(
+                serde_json::json!({"path": allow_root.join("public/file.txt").to_str().unwrap()}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            allowed.success,
+            "a sibling under the same allow root but outside the denied subtree must pass: {:?}",
+            allowed.error
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
     // ── Composition test ──────────────────────────────────────────────────────
 
     #[tokio::test]
