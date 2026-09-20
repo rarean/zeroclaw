@@ -659,10 +659,14 @@ pub(crate) fn default_forbidden_paths() -> Vec<String> {
 /// makes `deny_read` win over every workspace-scoped grant, the workspace
 /// itself included.
 ///
-/// An operator who spells a denial exactly like a default entry (`deny_read =
-/// ["/tmp"]` with the workspace at `/tmp`) is indistinguishable from the
-/// collision case and reads as the collision — the default list owns that
-/// spelling. Naming the workspace root by any other spelling denies.
+/// Spelling alone cannot distinguish the two, so every caller combines this
+/// test with provenance (see `SecurityPolicy::entry_is_builtin_default`): a
+/// canonical `sandbox_policy.deny_read = ["/tmp"]` with the workspace at
+/// `/tmp` is an OPERATOR denial — RFC 6996 keeps explicit canonical values
+/// authoritative "including values that happen to resemble legacy defaults" —
+/// while the same spelling arriving via the legacy `forbidden_paths`
+/// fallback (how `RiskProfileConfig::default()` and the presets ship the
+/// default list) is the built-in root.
 fn is_default_forbidden_entry(entry: &str) -> bool {
     default_forbidden_paths().iter().any(|d| d == entry)
 }
@@ -789,7 +793,11 @@ fn deepest_forbidden_depth(
 /// [`deepest_forbidden_depth`], split by entry provenance: the returned pair is
 /// `(operator_depth, default_depth)` — the deepest match among
 /// operator-authored entries and among built-in default safety roots
-/// ([`is_default_forbidden_entry`]).
+/// (spelling test [`is_default_forbidden_entry`], suppressed entirely when the
+/// deny list came from an explicit canonical `sandbox_policy.deny_read`
+/// (`deny_read_is_canonical`): a canonical entry with a default-shaped
+/// spelling is operator-authored per RFC 6996 and always lands in the
+/// operator slot).
 ///
 /// The two are compared against a grant differently. An operator denial that
 /// TIES the granting root wins: RFC 6996 states write precedence flatly
@@ -805,6 +813,7 @@ fn split_forbidden_depths(
     forbidden_paths: &[String],
     expanded: &Path,
     namespace: PathMatchNamespace,
+    deny_read_is_canonical: bool,
 ) -> (Option<usize>, Option<usize>) {
     let mut operator: Option<usize> = None;
     let mut default: Option<usize> = None;
@@ -813,7 +822,7 @@ fn split_forbidden_depths(
         let Some(depth) = namespace_prefix_match_depth(&forbidden_path, expanded, namespace) else {
             continue;
         };
-        let slot = if is_default_forbidden_entry(forbidden) {
+        let slot = if !deny_read_is_canonical && is_default_forbidden_entry(forbidden) {
             &mut default
         } else {
             &mut operator
@@ -1009,6 +1018,9 @@ impl Default for SecurityPolicy {
             guardrail_exceptions: Vec::new(),
             sandbox_inputs: crate::sandbox_policy::EffectiveSandboxInputs {
                 deny_read: default_forbidden_paths(),
+                // The bare default IS the built-in list — not an operator
+                // canonical value — so the workspace-root carve-out applies.
+                deny_read_is_canonical: false,
                 allow_read: Vec::new(),
                 allow_write: crate::schema::DEFAULT_ALLOW_WRITE
                     .iter()
@@ -4494,6 +4506,19 @@ impl SecurityPolicy {
     /// skip it). An OPERATOR-authored entry naming the workspace root is NOT
     /// skipped: RFC 6996 makes `deny_read` authoritative over every
     /// workspace-scoped grant, the workspace itself included.
+    /// Provenance-aware [`is_default_forbidden_entry`]: `entry` counts as a
+    /// built-in default safety root only when the deny list did NOT come from
+    /// an explicit canonical `sandbox_policy.deny_read`. A canonical
+    /// `deny_read = ["/tmp"]` is an operator denial even though the default
+    /// list uses the same spelling (RFC 6996: explicit canonical values stay
+    /// authoritative "including values that happen to resemble legacy
+    /// defaults"); the same string via the legacy `forbidden_paths` fallback —
+    /// the channel `RiskProfileConfig::default()` and the presets use to ship
+    /// the default list — is the built-in root.
+    fn entry_is_builtin_default(&self, entry: &str) -> bool {
+        !self.sandbox_inputs.deny_read_is_canonical && is_default_forbidden_entry(entry)
+    }
+
     fn deepest_resolved_forbidden_depth_within_allow(&self, resolved: &Path) -> Option<usize> {
         let workspace_root = self
             .workspace_dir
@@ -4502,7 +4527,7 @@ impl SecurityPolicy {
         let mut best: Option<usize> = None;
         for forbidden in &self.forbidden_paths {
             let forbidden_path = resolve_policy_entry(forbidden, &self.workspace_dir);
-            if forbidden_path == workspace_root && is_default_forbidden_entry(forbidden) {
+            if forbidden_path == workspace_root && self.entry_is_builtin_default(forbidden) {
                 continue;
             }
             if let Some(depth) = namespace_prefix_match_depth(
@@ -4592,7 +4617,7 @@ impl SecurityPolicy {
             // root still denies here: RFC 6996 puts `deny_read` above every
             // workspace-scoped grant, the workspace itself included.
             let coincidental_default_root =
-                forbidden_path == workspace_root && is_default_forbidden_entry(forbidden);
+                forbidden_path == workspace_root && self.entry_is_builtin_default(forbidden);
             if !coincidental_default_root
                 && forbidden_path.starts_with(&workspace_root)
                 && resolved.starts_with(&forbidden_path)
@@ -4853,11 +4878,16 @@ impl SecurityPolicy {
             // list and the default write roots (both name `/tmp`) rather than
             // a denial competing with the grant; denying there would nullify
             // an explicit `allow_write = ["/tmp"]` that the field's contract
-            // says always wins. See `split_forbidden_depths`.
+            // says always wins. Provenance decides which case applies: a
+            // canonical `sandbox_policy.deny_read` entry is operator-authored
+            // even in default spelling (see `deny_read_is_canonical`); only
+            // the legacy fallback can produce the built-in root. See
+            // `split_forbidden_depths`.
             let (operator_depth, default_depth) = split_forbidden_depths(
                 &self.forbidden_paths,
                 resolved,
                 PathMatchNamespace::Resolved,
+                self.sandbox_inputs.deny_read_is_canonical,
             );
             if forbidden_overrides_allow(operator_depth, allow_depth) {
                 return false;
@@ -10872,6 +10902,95 @@ mod tests {
         assert!(
             !policy.is_resolved_path_readable(&target),
             "an operator deny_read naming the workspace root must block reads inside it"
+        );
+    }
+
+    #[test]
+    fn canonical_deny_read_with_default_spelling_blocks_workspace_root() {
+        // Round-6 regression: provenance, not spelling, decides the
+        // workspace-root carve-out. `sandbox_policy.deny_read = ["/tmp"]` with
+        // the workspace at exactly `/tmp` is an explicit canonical value that
+        // "happens to resemble a legacy default" — RFC 6996 keeps it
+        // authoritative, so the coincidental-default-root carve-out must NOT
+        // fire and reads under the workspace root stay denied. Mirrors
+        // `operator_deny_read_naming_the_workspace_root_blocks`, which uses a
+        // non-default spelling and could not catch this.
+        #[cfg(not(target_os = "windows"))]
+        let literal_forbidden_root = std::path::PathBuf::from("/tmp");
+        #[cfg(target_os = "windows")]
+        let literal_forbidden_root = std::path::PathBuf::from(r"C:\Windows");
+
+        let deny_spelling = literal_forbidden_root.display().to_string();
+        let workspace_root = literal_forbidden_root
+            .canonicalize()
+            .unwrap_or(literal_forbidden_root);
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.deny_read = Some(vec![deny_spelling]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, &workspace_root);
+
+        assert!(
+            !policy.is_resolved_path_readable(&workspace_root.join("some_file.txt")),
+            "a canonical deny_read using the default spelling must still deny the workspace root"
+        );
+    }
+
+    #[test]
+    fn canonical_deny_read_default_spelling_ties_to_deny_against_allow_read() {
+        // The same provenance fix through the allow-tier deny pass
+        // (`deepest_resolved_forbidden_depth_within_allow`): a canonical
+        // deny_read at the same depth as an allow_read root denies (tie goes
+        // to the deny) instead of being skipped as a default root.
+        let workspace = Path::new("/tmp");
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.deny_read = Some(vec!["/tmp".to_string()]);
+        profile.sandbox_policy.allow_read = Some(vec!["/tmp".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_readable(Path::new("/tmp/file.txt")),
+            "canonical deny_read tying the allow_read root must deny"
+        );
+    }
+
+    #[test]
+    fn legacy_forbidden_paths_with_default_spelling_keeps_workspace_grant() {
+        // The compat side of the same rule: the identical "/tmp" string
+        // arriving through the legacy top-level `forbidden_paths` field — the
+        // way `RiskProfileConfig::default()` and the presets ship the default
+        // safety list — remains the built-in default root, and a workspace
+        // rooted exactly there keeps its read grant.
+        let workspace = PathBuf::from("/tmp");
+        if !workspace.exists() {
+            return;
+        }
+        let profile = crate::schema::RiskProfileConfig {
+            forbidden_paths: vec!["/tmp".to_string()],
+            ..Default::default()
+        };
+        let policy = SecurityPolicy::from_risk_profile(&profile, &workspace);
+
+        assert!(
+            policy.is_resolved_path_readable(&workspace.join("some_file.txt")),
+            "a legacy default-shaped forbidden entry must keep coexisting with a workspace at that root"
+        );
+    }
+
+    #[test]
+    fn canonical_deny_read_default_spelling_counts_as_operator_on_write_ties() {
+        // Write-side `split_forbidden_depths` uses the same provenance: a
+        // canonical deny_read entry — even in default spelling — is
+        // operator-authored, so it ties-to-deny against an allow_write grant
+        // of the same root instead of losing like a built-in default root
+        // colliding with `DEFAULT_ALLOW_WRITE`.
+        let workspace = Path::new("/tmp");
+        let mut profile = crate::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.deny_read = Some(vec!["/tmp".to_string()]);
+        profile.sandbox_policy.allow_write = Some(vec!["/tmp".to_string()]);
+        let policy = SecurityPolicy::from_risk_profile(&profile, workspace);
+
+        assert!(
+            !policy.is_resolved_path_allowed(Path::new("/tmp/file.txt")),
+            "canonical deny_read tie against an allow_write grant must deny (operator provenance)"
         );
     }
 

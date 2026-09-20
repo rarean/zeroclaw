@@ -17,6 +17,20 @@ use std::path::{Path, PathBuf};
 pub struct EffectiveSandboxInputs {
     /// `sandbox_policy.deny_read` if `Some`, else legacy `forbidden_paths`.
     pub deny_read: Vec<String>,
+    /// Whether [`Self::deny_read`] came from an explicit canonical
+    /// `sandbox_policy.deny_read` (`Some`, including the `forbidden_paths`
+    /// alias inside that table) rather than the legacy top-level
+    /// `forbidden_paths` fallback. The default safety list itself ships
+    /// through the LEGACY field (`RiskProfileConfig::default()` and the
+    /// presets populate it with `default_forbidden_paths()`), so this flag —
+    /// not the entry's spelling — is what tells an operator-authored
+    /// `deny_read = ["/tmp"]` apart from the built-in `/tmp` root. RFC 6996
+    /// keeps explicit canonical values authoritative "including values that
+    /// happen to resemble legacy defaults"; the app-layer carve-outs
+    /// (`SecurityPolicy::is_resolved_path_readable` and its depth helpers)
+    /// consult this flag so a canonical entry never reads as a coincidental
+    /// default-root collision.
+    pub deny_read_is_canonical: bool,
     /// `sandbox_policy.allow_read` if `Some`, else legacy `allowed_roots`.
     pub allow_read: Vec<String>,
     /// See [`Self::from_profile`] for the full `allow_write` precedence rules.
@@ -102,6 +116,11 @@ impl EffectiveSandboxInputs {
             .deny_read
             .clone()
             .unwrap_or_else(|| profile.forbidden_paths.clone());
+        // Provenance for the workspace-root carve-out (RFC 6996): `Some` —
+        // any canonical spelling — is operator-authored even when it equals a
+        // `default_forbidden_paths()` entry; only the legacy fallback (where
+        // the default list actually lives) can produce a built-in root.
+        let deny_read_is_canonical = sp.deny_read.is_some();
         let allow_read = sp
             .allow_read
             .clone()
@@ -129,6 +148,7 @@ impl EffectiveSandboxInputs {
 
         Self {
             deny_read,
+            deny_read_is_canonical,
             allow_read,
             allow_write,
             allow_write_is_explicit,
@@ -155,8 +175,10 @@ impl EffectiveSandboxInputs {
                 .collect()
         };
         let _ = workspace;
+        let deny_read_is_canonical = sp.deny_read.is_some();
         Self {
             deny_read: sp.deny_read.clone().unwrap_or_default(),
+            deny_read_is_canonical,
             allow_read: sp.allow_read.clone().unwrap_or_default(),
             allow_write,
             allow_write_is_explicit,

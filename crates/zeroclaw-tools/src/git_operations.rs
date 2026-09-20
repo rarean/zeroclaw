@@ -10,10 +10,44 @@ use zeroclaw_config::policy::SecurityPolicy;
 /// against. `GitOperationsTool` is registered without the `PathGuardedTool`
 /// wrapper, so these checks are the only enforcement of `deny_read` /
 /// `deny_write` over paths Git reads or mutates.
+///
+/// The operation boundary covers repository-controlled child processes too
+/// (RFC 6996): hooks are neutralized for every Git invocation
+/// ([`nohooks_core_hooks_path`]), and write-classified operations fail closed
+/// when the repository configures filter drivers
+/// ([`GitOperationsTool::ensure_no_configured_filters`]). Arbitrary
+/// user-supplied shell commands remain outside this tool's boundary.
 #[derive(Clone, Copy)]
 enum GitAccess {
     Read,
     Write,
+}
+
+/// `core.hooksPath` value pointing every Git invocation this tool launches at
+/// a shared empty directory, so repository-controlled hooks (`.git/hooks/*`
+/// or a configured `core.hooksPath`) cannot execute as Git child processes
+/// outside the pathset the preflights authorized. A `-c` on the command line
+/// outranks the repository's `.git/config`, so this neutralizes both sources.
+/// Returned as the ready-to-use `core.hooksPath=<dir>` config string.
+///
+/// Hooks that previously ran during agent-driven commit/checkout/stash no
+/// longer run — a documented behavior change of the RFC 6996 operation
+/// boundary (operators who need hooks run Git directly).
+fn nohooks_core_hooks_path() -> String {
+    static NOHOOKS: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    let dir = NOHOOKS
+        .get_or_init(|| {
+            let dir =
+                std::env::temp_dir().join(format!("zeroclaw-git-nohooks-{}", std::process::id()));
+            // Creation failure is tolerable in the fail-closed direction: the
+            // path only matters when Git tries to run a hook, and a missing
+            // hooks directory aborts hook execution rather than falling back
+            // to the repository's `.git/hooks`.
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        })
+        .clone();
+    format!("core.hooksPath={}", dir.display())
 }
 
 impl GitAccess {
@@ -238,6 +272,8 @@ impl GitOperationsTool {
         working_dir: &std::path::Path,
     ) -> anyhow::Result<String> {
         let output = tokio::process::Command::new("git")
+            .arg("-c")
+            .arg(nohooks_core_hooks_path())
             .args(args)
             .current_dir(working_dir)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -265,6 +301,8 @@ impl GitOperationsTool {
         working_dir: &std::path::Path,
     ) -> anyhow::Result<Vec<u8>> {
         let output = tokio::process::Command::new("git")
+            .arg("-c")
+            .arg(nohooks_core_hooks_path())
             .args(args)
             .current_dir(working_dir)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -278,6 +316,66 @@ impl GitOperationsTool {
         }
 
         Ok(output.stdout)
+    }
+
+    /// RFC 6996 operation boundary: a write-classified Git operation must not
+    /// execute repository-controlled child processes outside the pathset its
+    /// preflights authorized. Git runs locally configured filter drivers
+    /// (`filter.<driver>.clean`/`smudge`/`process`, set in the repository's
+    /// `.git/config`) on add/checkout paths; there is no clean Git mechanism
+    /// to disable them, so the operation fails closed, naming the drivers, as
+    /// the RFC prescribes when a tool cannot safely determine its mutation
+    /// set. Hooks are handled separately — neutralized for every invocation
+    /// via [`nohooks_core_hooks_path`].
+    async fn ensure_no_configured_filters(
+        &self,
+        operation: &str,
+        working_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let output = tokio::process::Command::new("git")
+            .args([
+                "config",
+                "--local",
+                "--name-only",
+                "--get-regexp",
+                "^filter\\.",
+            ])
+            .current_dir(working_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "{operation} blocked: cannot determine whether the repository configures \
+                     Git filter drivers: {e}"
+                ))
+            })?;
+        match output.status.code() {
+            Some(0) => {}
+            // `git config --get-regexp` exits 1 when nothing matches: no
+            // configured filters, the operation may proceed.
+            Some(1) if output.stdout.is_empty() => return Ok(()),
+            _ => anyhow::bail!(
+                "{operation} blocked: cannot prove the repository configures no Git filter \
+                 drivers (git config probe failed)"
+            ),
+        }
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let drivers: Vec<&str> = listing
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if drivers.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{operation} blocked: the repository configures Git filter driver(s) [{}], which \
+             Git would run as child processes outside the paths this operation authorized. \
+             Remove the filter configuration, or run Git directly outside the agent, to proceed.",
+            drivers.join(", ")
+        );
     }
 
     /// Decode NUL-delimited `-z` pathset output into exact pathnames.
@@ -1620,6 +1718,21 @@ impl Tool for GitOperationsTool {
                 }
                 AutonomyLevel::Supervised | AutonomyLevel::Full => {}
             }
+
+            // RFC 6996 operation boundary: hooks are neutralized for every
+            // Git invocation (runners inject an empty `core.hooksPath`);
+            // locally configured filter drivers cannot be disabled, so the
+            // whole write operation fails closed when any exist.
+            if let Err(e) = self
+                .ensure_no_configured_filters(operation, &working_dir)
+                .await
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(e.to_string()),
+                });
+            }
         }
 
         // Record action for rate limiting
@@ -1913,6 +2026,142 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("higher autonomy")
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_marker_hook(hook_path: &std::path::Path, marker: &std::path::Path) {
+        if let Some(parent) = hook_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(
+            hook_path,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn commit_does_not_execute_repository_hooks() {
+        // RFC 6996 operation boundary (round 6): a repository-controlled hook
+        // is a side effect of the covered Git operation, not an arbitrary
+        // shell command supplied as a separate call, so it must not execute
+        // outside the authorized pathset. The runners pin `core.hooksPath` at
+        // an empty directory; the marker-writing hook never runs and the
+        // commit itself succeeds.
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        std::fs::write(tmp.path().join("f.txt"), b"x").unwrap();
+        let marker = tmp.path().join("hook_marker.txt");
+        write_marker_hook(&tmp.path().join(".git/hooks/pre-commit"), &marker);
+
+        let tool = test_tool(tmp.path());
+        let add = tool
+            .execute(json!({"operation": "add", "paths": "."}))
+            .await
+            .unwrap();
+        assert!(add.success, "add should succeed: {:?}", add.error);
+        let commit = tool
+            .execute(json!({"operation": "commit", "message": "test"}))
+            .await
+            .unwrap();
+        assert!(
+            commit.success,
+            "commit should succeed with hooks neutralized: {:?}",
+            commit.error
+        );
+        assert!(
+            !marker.exists(),
+            "a repository pre-commit hook must not execute during an agent-driven commit"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn commit_does_not_execute_configured_hooks_path_hooks() {
+        // A repository may relocate hooks via `core.hooksPath` in
+        // `.git/config`; the runner's command-line `-c` outranks repository
+        // config, so hooks there are neutralized identically.
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        let hooks_dir = tmp.path().join("custom-hooks");
+        let marker = tmp.path().join("hookspath_marker.txt");
+        write_marker_hook(&hooks_dir.join("pre-commit"), &marker);
+        std::process::Command::new("git")
+            .args(["config", "core.hooksPath"])
+            .arg(hooks_dir.as_os_str())
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::fs::write(tmp.path().join("f.txt"), b"x").unwrap();
+
+        let tool = test_tool(tmp.path());
+        let add = tool
+            .execute(json!({"operation": "add", "paths": "."}))
+            .await
+            .unwrap();
+        assert!(add.success, "add should succeed: {:?}", add.error);
+        let commit = tool
+            .execute(json!({"operation": "commit", "message": "test"}))
+            .await
+            .unwrap();
+        assert!(commit.success, "commit should succeed: {:?}", commit.error);
+        assert!(
+            !marker.exists(),
+            "hooks under a configured core.hooksPath must not execute"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_ops_fail_closed_when_filters_configured() {
+        // Locally configured filter drivers cannot be disabled for a Git
+        // invocation, so a write-classified operation fails closed, naming
+        // the drivers, instead of letting a repository-controlled filter
+        // process run outside the authorized pathset. Read-classified
+        // operations are unaffected by the filter gate.
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        std::fs::write(tmp.path().join("f.txt"), b"x").unwrap();
+        let tool = test_tool(tmp.path());
+        let add = tool
+            .execute(json!({"operation": "add", "paths": "."}))
+            .await
+            .unwrap();
+        assert!(add.success, "pre-stage should succeed: {:?}", add.error);
+
+        for (key, value) in [
+            ("filter.test.clean", "true"),
+            ("filter.test.smudge", "true"),
+        ] {
+            std::process::Command::new("git")
+                .args(["config", key, value])
+                .current_dir(tmp.path())
+                .output()
+                .unwrap();
+        }
+
+        let commit = tool
+            .execute(json!({"operation": "commit", "message": "test"}))
+            .await
+            .unwrap();
+        assert!(
+            !commit.success,
+            "commit must fail closed while filter drivers are configured"
+        );
+        let err = commit.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("filter.test.clean"),
+            "the denial must name the filter driver: {err}"
+        );
+
+        let status = tool.execute(json!({"operation": "status"})).await.unwrap();
+        assert!(
+            status.success,
+            "read operations must not be blocked by the filter gate: {:?}",
+            status.error
         );
     }
 

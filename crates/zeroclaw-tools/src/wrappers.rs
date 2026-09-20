@@ -533,6 +533,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn path_guard_read_mode_blocks_canonical_deny_read_in_default_spelling() {
+        // Round-6 execution-level regression: the read wrapper consumes
+        // `is_resolved_path_readable`, so a canonical
+        // `sandbox_policy.deny_read = ["/tmp"]` with the workspace rooted at
+        // exactly `/tmp` must block a tool read at the wrapper boundary, not
+        // only in the unit checker. The policy is built through
+        // `from_risk_profile` so the shared resolver sets the
+        // `deny_read_is_canonical` provenance flag the workspace-root
+        // carve-out consults — a directly-constructed `SecurityPolicy` cannot
+        // represent this configuration.
+        #[cfg(not(target_os = "windows"))]
+        let (deny_spelling, workspace) = ("/tmp".to_string(), std::path::PathBuf::from("/tmp"));
+        #[cfg(target_os = "windows")]
+        let (deny_spelling, workspace) = (
+            r"C:\Windows".to_string(),
+            std::path::PathBuf::from(r"C:\Windows"),
+        );
+
+        let mut profile = zeroclaw_config::schema::RiskProfileConfig::default();
+        profile.sandbox_policy.deny_read = Some(vec![deny_spelling]);
+        let sec = Arc::new(SecurityPolicy::from_risk_profile(&profile, &workspace));
+
+        let (inner, counter) = CountingTool::new();
+        let tool = PathGuardedTool::new(inner, sec, PathAccessMode::Read);
+
+        let target = workspace.join("zeroclaw_round6_probe.txt");
+        std::fs::write(&target, b"x").ok();
+        let result = tool
+            .execute(serde_json::json!({"path": target.to_str().unwrap()}))
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&target);
+
+        assert!(
+            !result.success,
+            "a canonical deny_read in default spelling must block the read at the wrapper"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "inner must not be called when the wrapper denies the read"
+        );
+    }
+
+    #[tokio::test]
     async fn path_guard_read_mode_allows_unrelated_absolute_workspace_target() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sec = Arc::new(SecurityPolicy {
