@@ -3852,6 +3852,8 @@ mod reported_budget_tests {
 
     #[tokio::test]
     async fn enforce_retrims_against_the_prepared_population_for_retained_images() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+
         // `estimate_history_tokens` now charges the same fixed per-image cost
         // whether a `[IMAGE:...]` marker holds a path or the base64 payload
         // preparation resolves it to, so the raw and prepared populations for
@@ -3863,14 +3865,14 @@ mod reported_budget_tests {
         // request (prepared retained messages), not drift from it.
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("shot.png");
-        // PNG signature plus padding: MIME detection only needs the
-        // extension, but the padding keeps the base64 expansion larger than
-        // the marker's own path text regardless of how long the platform's
-        // temp-dir path is (a bare 8-byte signature can lose that race on
-        // Windows CI runners, whose temp paths run longer than Linux's).
-        let mut fake_png = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
-        fake_png.extend(vec![0u8; 4096]);
-        std::fs::write(&image_path, &fake_png).unwrap();
+        // Use a fully decodable image: the multimodal boundary intentionally
+        // rejects files that merely carry a valid signature.
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        std::fs::write(
+            &image_path,
+            STANDARD.decode(PNG_B64).expect("valid PNG fixture"),
+        )
+        .unwrap();
         let marker = format!("[IMAGE:{}]", image_path.display());
         let big = "x".repeat(2000);
         let mut history = vec![

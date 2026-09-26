@@ -4634,13 +4634,16 @@ impl RpcDispatcher {
             .apply_model_provider(
                 session_id,
                 session_generation,
-                provider,
-                provider_name,
-                model,
-                resolver,
-                dispatcher,
-                config_generation,
-                Some(temperature),
+                crate::rpc::session::ModelProviderUpdate {
+                    model_provider: provider,
+                    model_provider_name: provider_name,
+                    model_name: model,
+                    model_route_resolver: resolver,
+                    tool_dispatcher: dispatcher,
+                    config_generation: Arc::clone(&config_generation),
+                    temperature: Some(temperature),
+                    multimodal_config: config_generation.multimodal.clone(),
+                },
             )
             .await
     }
@@ -5581,15 +5584,18 @@ impl RpcDispatcher {
                 .apply_model_provider(
                     &req.session_id,
                     session_generation,
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    model_route_resolver,
-                    tool_dispatcher,
-                    config_generation,
-                    // Temperature is already committed through
-                    // `set_overrides_gated` on this path.
-                    None,
+                    crate::rpc::session::ModelProviderUpdate {
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        model_route_resolver,
+                        tool_dispatcher,
+                        config_generation: Arc::clone(&config_generation),
+                        // Temperature is already committed through
+                        // `set_overrides_gated` on this path.
+                        temperature: None,
+                        multimodal_config: config_generation.multimodal.clone(),
+                    },
                 )
                 .await
                 .then_some(())
@@ -6675,17 +6681,18 @@ impl RpcDispatcher {
                 .apply_model_provider(
                     &session_id,
                     session_generation,
-                    model_provider,
-                    model_provider_name,
-                    model_name,
-                    model_route_resolver,
-                    tool_dispatcher,
-                    Arc::clone(&config_generation),
-                    // Temperature travels in the same state transition as the
-                    // provider box rather than a follow-up `set_temperature`,
-                    // so a session cannot briefly show the new provider with
-                    // the old profile temperature.
-                    Some(temperature),
+                    crate::rpc::session::ModelProviderUpdate {
+                        model_provider,
+                        model_provider_name,
+                        model_name,
+                        model_route_resolver,
+                        tool_dispatcher,
+                        config_generation: Arc::clone(&config_generation),
+                        // Temperature travels in the same state transition as
+                        // the provider box rather than a follow-up setter.
+                        temperature: Some(temperature),
+                        multimodal_config: config_generation.multimodal.clone(),
+                    },
                 )
                 .await;
             if applied {
