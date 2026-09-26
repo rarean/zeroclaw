@@ -346,6 +346,7 @@ struct ModelFetchResult {
     model_provider_ref: String,
     models: Vec<String>,
     current: Option<String>,
+    error: Option<String>,
 }
 
 /// Completion of a background lost-session re-attachment. The message queue
@@ -508,6 +509,18 @@ struct PromptCompletion {
     turn_generation: u64,
     error: Option<String>,
     transport_closed: bool,
+}
+
+/// Map a wire `token_source` value ("provider"/"estimate"/"calibrated") to the
+/// Fluent key whose localized label describes that provenance. Unknown values
+/// (older or future daemons) fall back to a label-less render.
+fn token_source_fluent_key(source: &str) -> String {
+    match source {
+        "provider" => "zc-chat-history-trimmed-token-source-provider".to_string(),
+        "estimate" => "zc-chat-history-trimmed-token-source-estimate".to_string(),
+        "calibrated" => "zc-chat-history-trimmed-token-source-calibrated".to_string(),
+        other => format!("zc-chat-history-trimmed-token-source-{other}"),
+    }
 }
 
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
@@ -3864,13 +3877,17 @@ impl Chat {
         })
     }
 
-    /// Fetch the model catalog for the full model_provider reference. Returns an empty vec
-    /// on failure; the caller surfaces the error on the info bar.
-    async fn fetch_models(rpc: &RpcClient, model_provider_ref: &str) -> Vec<String> {
-        match rpc.catalog_models(model_provider_ref).await {
-            Ok(res) => res.models,
-            Err(_) => Vec::new(),
-        }
+    /// Fetch the model catalog for a configured model_provider reference while
+    /// preserving an actionable RPC diagnostic separately from a successful
+    /// empty catalog.
+    async fn fetch_models(
+        rpc: &RpcClient,
+        model_provider_ref: &str,
+    ) -> Result<Vec<String>, String> {
+        rpc.catalog_models(model_provider_ref)
+            .await
+            .map(|res| res.models)
+            .map_err(|error| error.to_string())
     }
 
     /// Open the single-stage model picker for the active agent's model_provider,
@@ -3892,6 +3909,8 @@ impl Chat {
             return;
         };
         // Warm cache: open immediately, no fetch, no loading state.
+        // The full configured reference is the cache identity: two aliases in
+        // one family may have different endpoints, headers, and catalogs.
         if state.input_bar.model_catalog_provider() == Some(model_provider_ref.as_str())
             && !state.input_bar.model_catalog().is_empty()
         {
@@ -3922,18 +3941,28 @@ impl Chat {
         let tx = model_fetch_tx.clone();
         let session_id = state.session_id.clone();
         let session_model = state.model.clone();
+        let model_provider_ref_c = model_provider_ref.clone();
         tokio::spawn(async move {
-            let models = Self::fetch_models(&rpc, &model_provider_ref).await;
-            let current = match session_model {
-                Some(m) => Some(m),
-                None => Self::configured_model(&rpc, &model_provider_ref).await,
+            let catalog = Self::fetch_models(&rpc, &model_provider_ref_c).await;
+            let (models, error) = match catalog {
+                Ok(models) => (models, None),
+                Err(error) => (Vec::new(), Some(error)),
+            };
+            let current = if error.is_none() {
+                match session_model {
+                    Some(m) => Some(m),
+                    None => Self::configured_model(&rpc, &model_provider_ref_c).await,
+                }
+            } else {
+                None
             };
             let _ = tx
                 .send(ModelFetchResult {
                     session_id,
-                    model_provider_ref,
+                    model_provider_ref: model_provider_ref_c,
                     models,
                     current,
+                    error,
                 })
                 .await;
         });
@@ -3953,6 +3982,15 @@ impl Chat {
         if !matches!(state.model_picker, ModelPickerOverlay::Loading) {
             return;
         }
+        if let Some(error) = res.error {
+            state.model_picker = ModelPickerOverlay::None;
+            state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                "zc-model-catalog-failed",
+                &[("error", &error)],
+            )));
+            state.mark_dirty_full();
+            return;
+        }
         if res.models.is_empty() {
             state.model_picker = ModelPickerOverlay::None;
             state.info_message = Some(crate::widgets::InfoMessage::error(crate::i18n::t(
@@ -3963,7 +4001,7 @@ impl Chat {
         }
         state
             .input_bar
-            .set_model_catalog(res.model_provider_ref, res.models.clone());
+            .set_model_catalog(res.model_provider_ref.clone(), res.models.clone());
         state.model_picker = ModelPickerOverlay::Model(crate::widgets::PickerState::new(
             res.models,
             res.current.as_deref(),
@@ -9345,17 +9383,103 @@ impl ChatState {
             }
             SessionUpdate::HistoryTrimmed {
                 dropped_messages,
+                dropped_turns,
                 kept_turns,
                 reason,
+                token_budget,
+                tokens_before,
+                tokens_after,
+                tokens_before_source,
+                tokens_after_source,
+                unsatisfiable_floor,
                 ..
             } => {
                 self.freeze_prompt_settled_stream();
-                let dropped = dropped_messages.to_string();
+                let dropped = dropped_turns.unwrap_or(dropped_messages).to_string();
                 let kept = kept_turns.to_string();
-                let notice = crate::i18n::t_args(
-                    "zc-chat-history-trimmed",
-                    &[("reason", &reason), ("dropped", &dropped), ("kept", &kept)],
-                );
+                let dropped_kind = if dropped_turns == Some(1) {
+                    "one"
+                } else {
+                    "other"
+                };
+                let kept_kind = if kept_turns == 1 { "one" } else { "other" };
+                // The unsatisfiable newest-turn/schema floor is flagged
+                // explicitly by the runtime: the retained request cannot fit
+                // the configured budget even though history MAY have been
+                // trimmed on the way to that floor, so the notice must not
+                // claim a successful trim.
+                let at_floor = unsatisfiable_floor == Some(true);
+                let notice = if at_floor {
+                    crate::i18n::t_args(
+                        "zc-chat-history-trimmed-floor",
+                        &[
+                            ("reason", &reason),
+                            ("after", &tokens_after.unwrap_or_default().to_string()),
+                            ("budget", &token_budget.unwrap_or_default().to_string()),
+                        ],
+                    )
+                } else {
+                    match (tokens_before, tokens_after) {
+                        (Some(before), Some(after)) => {
+                            let mut notice = crate::i18n::t_args(
+                                if dropped_turns.is_some() {
+                                    "zc-chat-history-trimmed-tokens-turns"
+                                } else {
+                                    "zc-chat-history-trimmed-tokens"
+                                },
+                                &[
+                                    ("reason", &reason),
+                                    ("before", &before.to_string()),
+                                    ("after", &after.to_string()),
+                                    ("dropped", &dropped),
+                                    ("kept", &kept),
+                                    ("dropped-kind", dropped_kind),
+                                    ("kept-kind", kept_kind),
+                                ],
+                            );
+                            // The configured budget is context, never the trim
+                            // target: recovery trims toward a provider-overflow
+                            // target, so the notice must not present the
+                            // configured limit as governing the trim.
+                            if let Some(budget) = token_budget {
+                                notice.push_str(&crate::i18n::t_args(
+                                    "zc-chat-history-trimmed-token-budget-clause",
+                                    &[("budget", &budget.to_string())],
+                                ));
+                            }
+                            let before_label = tokens_before_source.as_deref().and_then(|source| {
+                                crate::i18n::try_t(&token_source_fluent_key(source))
+                            });
+                            let after_label = tokens_after_source.as_deref().and_then(|source| {
+                                crate::i18n::try_t(&token_source_fluent_key(source))
+                            });
+                            if let (Some(before_label), Some(after_label)) =
+                                (before_label, after_label)
+                            {
+                                notice.push(' ');
+                                notice.push_str(&crate::i18n::t_args(
+                                    "zc-chat-history-trimmed-token-sources",
+                                    &[("before", &before_label), ("after", &after_label)],
+                                ));
+                            }
+                            notice
+                        }
+                        _ => crate::i18n::t_args(
+                            if dropped_turns.is_some() {
+                                "zc-chat-history-trimmed-turns"
+                            } else {
+                                "zc-chat-history-trimmed"
+                            },
+                            &[
+                                ("reason", &reason),
+                                ("dropped", &dropped),
+                                ("kept", &kept),
+                                ("dropped-kind", dropped_kind),
+                                ("kept-kind", kept_kind),
+                            ],
+                        ),
+                    }
+                };
                 self.entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
@@ -11807,18 +11931,6 @@ mod tests {
         );
     }
 
-    /// B1 risk #2, automated: a bounded-range off-by-one can still satisfy the
-    /// line-count assertions the other tests make, and would surface only as
-    /// mis-aimed clicks and wrong copy regions in a real terminal.
-    ///
-    /// This sweeps EVERY scroll offset over a wrapped history (prose plus code
-    /// fences) and pins the coordinate invariants that scrolling, bottom
-    /// anchoring, copy targets and `entry_rects` all read:
-    ///   1. the resolved entry range covers the whole viewport window, so no
-    ///      visible row is projected from outside the range;
-    ///   2. the line-level window covers the viewport and `local_scroll`
-    ///      indexes a real row of the slice;
-    ///   3. the materialized line count is exactly the resolved line window.
     #[test]
     fn visible_range_coordinate_invariants_hold_at_every_scroll_offset() {
         let mut s = state();
@@ -11917,6 +12029,64 @@ mod tests {
             .unwrap_or_else(|_| panic!("{reason}"))
             .expect("session reattach result channel should stay open");
         chat.apply_session_reattach_result(update);
+    }
+
+    #[tokio::test]
+    async fn model_picker_catalog_request_preserves_configured_hailo_alias() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(writer_tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+        let mut active = state();
+        active.set_model_identity(Some("hailo_ollama.edge"), Some("edge-model"));
+
+        Chat::open_model_picker(&rpc, &fetch_tx, &mut active).await;
+        let request =
+            next_rpc_request(&mut writer_rx, "model picker should request a catalog").await;
+        assert_eq!(
+            request["method"],
+            crate::client::method::CONFIG_CATALOG_MODELS
+        );
+        assert_eq!(request["params"]["model_provider"], "hailo_ollama.edge");
+        respond_ok(
+            &outbound,
+            &request,
+            serde_json::json!({"models": ["edge-model"], "live": true}),
+        );
+        let fetched = fetch_rx.recv().await.expect("catalog result should arrive");
+        assert_eq!(fetched.model_provider_ref, "hailo_ollama.edge");
+        assert_eq!(fetched.models, vec!["edge-model"]);
+        assert!(fetched.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn model_picker_catalog_error_remains_distinct_from_empty_catalog() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        {
+            let active = active_state(&mut chat);
+            active.model_picker = ModelPickerOverlay::Loading;
+        }
+
+        chat.apply_model_fetch(ModelFetchResult {
+            session_id: "sess-1".to_string(),
+            model_provider_ref: "hailo_ollama.edge".to_string(),
+            models: Vec::new(),
+            current: None,
+            error: Some("HTTP 401 Unauthorized".to_string()),
+        });
+
+        let active = active_state(&mut chat);
+        assert!(matches!(active.model_picker, ModelPickerOverlay::None));
+        let message = active
+            .info_message
+            .as_ref()
+            .expect("catalog failure should surface an info-bar error");
+        assert!(
+            message.text.contains("401"),
+            "actionable catalog diagnostic was lost: {}",
+            message.text
+        );
+        assert_ne!(message.text, crate::i18n::t("zc-model-catalog-empty"));
     }
 
     #[test]
@@ -17603,16 +17773,313 @@ mod tests {
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
             dropped_messages: 12,
+            dropped_turns: Some(4),
             kept_turns: 3,
             reason: "history message limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
         });
 
         assert!(matches!(
             s.entries().last(),
             Some(ChatEntry::SystemMessage(text))
                 if text.contains("history message limit exceeded")
-                    && text.contains("12")
+                    && text.contains("4 older turns dropped")
                     && text.contains("3")
+        ));
+    }
+
+    #[test]
+    fn legacy_history_trimmed_update_reports_message_count() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 12,
+            dropped_turns: None,
+            kept_turns: 3,
+            reason: "history message limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("12 messages dropped") && text.contains("3 turns kept")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_update_uses_singular_turn_copy() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            dropped_turns: Some(1),
+            kept_turns: 1,
+            reason: "history turn limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("1 older turn dropped; 1 turn kept")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_token_accounting_renders_in_notice() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 12,
+            dropped_turns: None,
+            kept_turns: 33,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("configured token budget: 500000")
+                    && text.contains("context token budget exceeded")
+                    && text.contains("12")
+                    && text.contains("33")
+                    && text.contains("provider")
+                    && text.contains("estimate")
+                    && text.contains("before")
+                    && text.contains("after")
+                    && !text.contains("against a")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_turn_counts_preserve_token_sources_and_floor_precedence() {
+        for (dropped_turns, floor) in [(1, false), (0, false), (1, true)] {
+            let mut s = state();
+            s.apply_update(SessionUpdate::HistoryTrimmed {
+                session_id: "sess-1".to_string(),
+                dropped_messages: 12,
+                dropped_turns: Some(dropped_turns),
+                kept_turns: 2,
+                reason: "context token budget exceeded".to_string(),
+                token_budget: Some(10_000),
+                tokens_before: Some(20_000),
+                tokens_after: Some(if floor { 12_000 } else { 6_000 }),
+                tokens_before_source: Some("provider".to_string()),
+                tokens_after_source: Some("calibrated".to_string()),
+                unsatisfiable_floor: floor.then_some(true),
+            });
+            let Some(ChatEntry::SystemMessage(text)) = s.entries().last() else {
+                panic!("expected trim notice");
+            };
+            if floor {
+                assert!(text.contains("could not be trimmed below the configured token budget"));
+                assert!(!text.contains("history was trimmed"));
+            } else {
+                let expected = if dropped_turns == 1 {
+                    "1 older turn dropped"
+                } else {
+                    "0 older turns dropped"
+                };
+                assert!(text.contains(expected), "{text}");
+                assert!(text.contains("2 turns kept"), "{text}");
+                assert!(text.contains("20000") && text.contains("6000"));
+                assert!(text.contains("provider") && text.contains("estimate"));
+                assert!(!text.contains("12 older"));
+            }
+        }
+    }
+
+    #[test]
+    fn history_trimmed_recovery_below_configured_budget_does_not_claim_budget_governed() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            dropped_turns: None,
+            kept_turns: 2,
+            reason: "context window overflow recovery".to_string(),
+            token_budget: Some(500_000),
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("context window overflow recovery")
+                    && text.contains("configured token budget: 500000")
+                    && !text.contains("against a")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_recovery_with_enforcement_disabled_renders_valid_counts() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            dropped_turns: None,
+            kept_turns: 2,
+            reason: "context window overflow recovery".to_string(),
+            token_budget: None,
+            tokens_before: Some(612_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("612000")
+                    && text.contains("117000")
+                    && text.contains("context window overflow recovery")
+                    && !text.contains("budget")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_untrimmable_floor_does_not_claim_history_changed() {
+        // The unsatisfiable newest-turn/schema floor carries the explicit
+        // `unsatisfiable_floor` flag while the projected `tokens_after`
+        // still exceeds the configured budget. The notice must not claim
+        // history was trimmed.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 0,
+            dropped_turns: None,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(117_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("calibrated".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: Some(true),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("could not be trimmed below the configured token budget")
+                    && text.contains("117000")
+                    && text.contains("configured budget: 100000")
+                    && !text.contains("was trimmed:")
+                    && !text.contains("messages dropped")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_floor_with_real_drops_reports_both_facts() {
+        // A breadcrumb-induced floor after real turns were removed carries
+        // BOTH the honest drop count and the unsatisfiable flag; the notice
+        // must use the floor wording, not claim an ordinary successful trim.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            dropped_turns: None,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(200_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: Some(true),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("could not be trimmed below the configured token budget")
+                    && text.contains("configured budget: 100000")
+                    && !text.contains("Earlier conversation history was trimmed")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_without_flag_keeps_trimmed_wording_when_over_budget() {
+        // Older daemons never emit the flag; their events must keep rendering
+        // through the ordinary wording paths even when counts exceed the
+        // budget, so the flag alone drives the floor discriminator.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 1,
+            dropped_turns: None,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(200_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("Earlier conversation history was trimmed")
+                    && !text.contains("could not be trimmed")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_estimated_sources_render_estimate_label() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            dropped_turns: None,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(10_000),
+            tokens_before: Some(12_000),
+            tokens_after: Some(6_000),
+            tokens_before_source: Some("estimate".to_string()),
+            tokens_after_source: Some("estimate".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("estimated")
+                    && text.contains("estimated before")
+                    && text.contains("estimated after")
         ));
     }
 

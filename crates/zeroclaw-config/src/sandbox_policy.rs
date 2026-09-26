@@ -209,7 +209,8 @@ fn resolve_deny_write(sp: &SandboxPolicyConfig) -> Vec<String> {
 ///   IMPLICIT workspace grant; an explicit canonical `allow_write` (including
 ///   an explicit `[]`) is authoritative for every path, workspace included.
 /// - Effective `workspace_only = true` with `allow_write: None` → the
-///   workspace root only (legacy behavior preserved).
+///   workspace root plus legacy `allowed_roots` (legacy read+write grant
+///   preserved).
 /// - `allow_write: None` — [`DEFAULT_ALLOW_WRITE`] merged with legacy
 ///   `allowed_roots` (dedup, defaults first). The top-level `allowed_roots`
 ///   field historically granted extra write access on top of the default
@@ -227,7 +228,17 @@ fn resolve_allow_write(
     }
 
     if effective_workspace_only {
-        return vec![workspace.to_string_lossy().into_owned()];
+        // Legacy `allowed_roots` has always been a read AND write grant (see
+        // `SecurityPolicy::allowed_roots`); under `workspace_only` it stays
+        // one. Dropping it here would silently turn every legacy root
+        // read-only, contradicting the documented compat mapping.
+        let mut scoped = vec![workspace.to_string_lossy().into_owned()];
+        for root in &profile.allowed_roots {
+            if !scoped.contains(root) {
+                scoped.push(root.clone());
+            }
+        }
+        return scoped;
     }
 
     let mut merged: Vec<String> = DEFAULT_ALLOW_WRITE
@@ -610,6 +621,22 @@ mod tests {
         };
         let policy = SandboxPolicy::from_risk_profile(&profile, ws());
         assert_eq!(policy.allow_write, vec![ws().to_path_buf()]);
+    }
+
+    #[test]
+    fn workspace_only_keeps_legacy_allowed_roots_writable() {
+        // Legacy `allowed_roots` is a read AND write grant; `workspace_only`
+        // must not demote it to read-only.
+        let profile = RiskProfileConfig {
+            workspace_only: true,
+            allowed_roots: vec!["/extra".to_string()],
+            ..RiskProfileConfig::default()
+        };
+        let policy = SandboxPolicy::from_risk_profile(&profile, ws());
+        assert_eq!(
+            policy.allow_write,
+            vec![ws().to_path_buf(), PathBuf::from("/extra")]
+        );
     }
 
     #[test]

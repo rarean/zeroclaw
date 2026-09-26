@@ -192,11 +192,14 @@ zc-logs-no-event-selected = No event selected
 zc-logs-loading = Loading…
 zc-logs-search-action-apply = apply
 zc-logs-search-action-cancel = cancel
+zc-logs-run-filter-label = run
+zc-logs-run-filter-clear = R:clear
 
 zc-logs-help-mouse-label = Mouse
 zc-logs-help-mouse-desc = Click rows, drag to select text, scroll wheel, double-click detail
 zc-logs-copy = Copy
 zc-logs-copied = [Copied]
+zc-logs-status-partial = [partial]
 
 zc-doctor-title = Doctor
 zc-doctor-loading = Loading diagnostics...
@@ -440,7 +443,28 @@ zc-chat-pane-acp = ACP
 
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
+zc-chat-history-trimmed-turns = Earlier conversation history was trimmed: { $reason } ({ $dropped } older { $dropped-kind ->
+    [one] turn
+   *[other] turns
+} dropped; { $kept } { $kept-kind ->
+    [one] turn
+   *[other] turns
+} kept).
 zc-chat-history-trimmed = Earlier conversation history was trimmed: { $reason } ({ $dropped } messages dropped; { $kept } turns kept).
+zc-chat-history-trimmed-tokens = Earlier conversation history was trimmed from approximately { $before } to { $after } tokens: { $reason }; { $dropped } messages dropped and { $kept } turns kept.
+zc-chat-history-trimmed-tokens-turns = Earlier conversation history was trimmed from approximately { $before } to { $after } tokens: { $reason }; { $dropped } older { $dropped-kind ->
+    [one] turn
+   *[other] turns
+} dropped and { $kept } { $kept-kind ->
+    [one] turn
+   *[other] turns
+} kept.
+zc-chat-history-trimmed-floor = The conversation history could not be trimmed below the configured token budget: { $reason }; the most recent turn still needs approximately { $after } tokens (configured budget: { $budget }).
+zc-chat-history-trimmed-token-budget-clause = (configured token budget: { $budget })
+zc-chat-history-trimmed-token-source-provider = provider-reported
+zc-chat-history-trimmed-token-source-estimate = estimated
+zc-chat-history-trimmed-token-source-calibrated = provider + estimate
+zc-chat-history-trimmed-token-sources = ({ $before } before; { $after } after)
 zc-chat-error-create-session = Failed to create session: { $error }
 zc-chat-error-resume-history = The session reattached, but its durable transcript could not be loaded: { $error }
 zc-chat-session-switch-error = Failed to switch session: { $error }
@@ -478,6 +502,7 @@ zc-model-switch-provider-ok = model_provider switched to { $provider } (model: {
 zc-model-switch-failed = Model switch failed: { $error }
 zc-model-catalog-no-provider = Could not resolve this agent's model_provider from config.
 zc-model-catalog-empty = No models available for the active model_provider.
+zc-model-catalog-failed = Could not load models for the active model_provider: { $error }
 zc-model-catalog-loading = Loading models…
 zc-model-provider-catalog-failed = Could not load model_providers: { $error }
 

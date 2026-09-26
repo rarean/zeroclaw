@@ -120,7 +120,7 @@ impl Drop for RuntimeProxyTestGuard {
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
-    ProviderCapabilityError, ToolCall, ToolResultMessage,
+    ProviderCapabilityError, ToolCall, ToolResultMessage, durable_chat_messages,
 };
 
 use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
@@ -692,6 +692,11 @@ pub struct ModelProviderRuntimeOptions {
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
     pub reasoning_effort: Option<String>,
+    /// Forward the runtime-configured `reasoning_effort` to every model on
+    /// OpenAI-compatible providers, bypassing the OpenAI-reasoning-family
+    /// name filter. Propagated from
+    /// `ModelProviderConfig::reasoning_effort_passthrough`.
+    pub reasoning_effort_passthrough: bool,
     /// HTTP request timeout in seconds for LLM model_provider API calls.
     /// `None` uses the model_provider's built-in default (120s for compatible model_providers).
     pub provider_timeout_secs: Option<u64>,
@@ -717,6 +722,11 @@ pub struct ModelProviderRuntimeOptions {
     /// message) into request bodies and capture gateway-reported cache
     /// usage. Propagated from `ModelProviderConfig::cache_passthrough`.
     pub cache_passthrough: bool,
+    /// Prompt-cache entry lifetime for providers that place Anthropic
+    /// cache markers (native Anthropic; compatible ones behind
+    /// `cache_passthrough`). `None` keeps the 5-minute default.
+    /// Propagated from `ModelProviderConfig::cache_ttl`.
+    pub cache_ttl: Option<zeroclaw_config::schema::CacheTtl>,
     /// When set, the provider is asked to use its native tool-calling
     /// schema instead of OpenAI-compat tool calls. Generic across families.
     pub native_tools: Option<bool>,
@@ -764,6 +774,7 @@ impl Default for ModelProviderRuntimeOptions {
             secrets_encrypt: true,
             reasoning_enabled: None,
             reasoning_effort: None,
+            reasoning_effort_passthrough: false,
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
@@ -772,6 +783,7 @@ impl Default for ModelProviderRuntimeOptions {
             provider_extra: None,
             replay_assistant_reasoning: None,
             cache_passthrough: false,
+            cache_ttl: None,
             native_tools: None,
             wire_api: None,
             think: None,
@@ -830,6 +842,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         secrets_encrypt: config.secrets.encrypt,
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
+        reasoning_effort_passthrough: entry.is_some_and(|e| e.reasoning_effort_passthrough),
         provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
         extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
         api_path: None,
@@ -838,6 +851,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
         cache_passthrough: entry.is_some_and(|e| e.cache_passthrough),
+        cache_ttl: entry.and_then(|e| e.cache_ttl),
         native_tools: entry.and_then(|e| e.native_tools),
         wire_api: entry.and_then(|e| e.wire_api.map(|w| w.as_str().to_string())),
         think: entry.and_then(|e| e.think),
@@ -911,10 +925,20 @@ pub fn options_for_provider_ref(
             // the fallback provider's capability flag. Clearing it falls back to
             // the family default (or the choke point's own resolution).
             options.vision = None;
+            // `reasoning_effort_passthrough` is a per-entry opt-in on a
+            // verified backend; a bare family has no entry and gets the
+            // default filter. The provider-agnostic `reasoning_effort` stays.
+            options.reasoning_effort_passthrough = false;
             // Tool-result image handling is provider-specific: a bare
             // fallback family must use its own default rather than inherit
             // the previous provider alias's policy.
             options.tool_result_image_policy = Default::default();
+            // Cache settings are provider-entry opt-ins: `cache_ttl` is a
+            // paid lifetime choice and `cache_passthrough` gates marker
+            // injection, so a bare family ref must not inherit another
+            // alias's cache opt-ins (there is no entry to turn them off on).
+            options.cache_ttl = None;
+            options.cache_passthrough = false;
             // `multimodal` is deliberately NOT reset: it is the root
             // `[multimodal]` section, identical for every alias, so a bare
             // family ref inherits the same operator policy rather than
@@ -964,12 +988,13 @@ fn token_end(input: &str, from: usize) -> usize {
 
 /// Remove credentials from HTTP(S) URLs embedded in error text.
 ///
-/// Query-value punctuation cannot safely identify where a credential ends:
-/// commas, apostrophes, and parentheses are all legal query data. Treat the
-/// URL's entire non-whitespace query tail as sensitive instead. This also
-/// covers credential parameter names that the sanitizer does not know about.
-/// URL userinfo is likewise always sensitive and is replaced as one unit while
-/// retaining the host and path needed for an actionable endpoint diagnostic.
+/// Query and fragment punctuation cannot safely identify where a credential
+/// ends: commas, apostrophes, and parentheses are all legal data. Treat the
+/// URL's entire non-whitespace query or fragment tail as sensitive instead.
+/// This also covers credential parameter names that the sanitizer does not know
+/// about. URL userinfo is likewise always sensitive and is replaced as one unit
+/// while retaining the host and path needed for an actionable endpoint
+/// diagnostic.
 fn scrub_url_credentials(input: &str) -> String {
     let lowercase = input.to_ascii_lowercase();
     let mut scrubbed = String::with_capacity(input.len());
@@ -995,22 +1020,25 @@ fn scrub_url_credentials(input: &str) -> String {
         let url_tail = &input[url_start..];
         let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
         let url_token = &input[url_start..url_end];
-        let without_query = url_token
-            .find('?')
-            .map_or(url_token, |query_start| &url_token[..query_start]);
-        let scheme_end = without_query
+        let sensitive_suffix_start = [url_token.find('?'), url_token.find('#')]
+            .into_iter()
+            .flatten()
+            .min();
+        let without_query_or_fragment =
+            sensitive_suffix_start.map_or(url_token, |suffix_start| &url_token[..suffix_start]);
+        let scheme_end = without_query_or_fragment
             .find("://")
             .map_or(0, |separator| separator + 3);
-        let authority_end = without_query[scheme_end..]
-            .find(['/', '#'])
-            .map_or(without_query.len(), |end| scheme_end + end);
-        let authority = &without_query[scheme_end..authority_end];
+        let authority_end = without_query_or_fragment[scheme_end..]
+            .find('/')
+            .map_or(without_query_or_fragment.len(), |end| scheme_end + end);
+        let authority = &without_query_or_fragment[scheme_end..authority_end];
         if let Some(userinfo_end) = authority.rfind('@') {
-            scrubbed.push_str(&without_query[..scheme_end]);
+            scrubbed.push_str(&without_query_or_fragment[..scheme_end]);
             scrubbed.push_str("[REDACTED]@");
-            scrubbed.push_str(&without_query[scheme_end + userinfo_end + 1..]);
+            scrubbed.push_str(&without_query_or_fragment[scheme_end + userinfo_end + 1..]);
         } else {
-            scrubbed.push_str(without_query);
+            scrubbed.push_str(without_query_or_fragment);
         }
         cursor = url_end;
     }
@@ -1021,9 +1049,9 @@ fn scrub_url_credentials(input: &str) -> String {
 /// Scrub known secret-like token prefixes from model_provider error strings.
 /// Provider API-key prefixes come from the same canonical table used for
 /// credential-family validation; non-provider prefixes cover Slack, GitHub,
-/// and Google/Gemini credentials. Complete query strings are removed from
-/// embedded HTTP(S) URLs because query parameters may carry credentials under
-/// provider-specific names.
+/// and Google/Gemini credentials. Complete query strings and fragments are
+/// removed from embedded HTTP(S) URLs because either suffix may carry
+/// credentials under provider-specific names.
 pub fn scrub_secret_patterns(input: &str) -> String {
     const NON_PROVIDER_SECRET_PREFIXES: &[&str] = &[
         "xoxb-",
@@ -3044,6 +3072,66 @@ mod tests {
     }
 
     #[test]
+    fn cache_ttl_config_field_maps_into_runtime_options() {
+        use zeroclaw_config::schema::{CacheTtl, Config, ModelProviderConfig};
+        let entry = ModelProviderConfig {
+            cache_ttl: Some(CacheTtl::OneHour),
+            ..Default::default()
+        };
+        let opts = model_provider_runtime_options_from_model_provider_entry(
+            &Config::default(),
+            Some(&entry),
+        );
+        assert_eq!(opts.cache_ttl, Some(CacheTtl::OneHour));
+        let defaults =
+            model_provider_runtime_options_from_model_provider_entry(&Config::default(), None);
+        assert_eq!(defaults.cache_ttl, None);
+    }
+
+    #[test]
+    fn bare_family_provider_ref_does_not_inherit_cache_settings() {
+        use zeroclaw_config::schema::{
+            AnthropicModelProviderConfig, CacheTtl, Config, ModelProviderConfig,
+        };
+        let mut config = Config::default();
+        config.multimodal.max_images = 1;
+        // The fallback alias opted into paid caching; a bare family ref has
+        // no entry that could hold (or turn off) those settings, so it must
+        // not inherit them.
+        let fallback = model_provider_runtime_options_from_model_provider_entry(
+            &config,
+            Some(&ModelProviderConfig {
+                cache_ttl: Some(CacheTtl::OneHour),
+                cache_passthrough: true,
+                ..Default::default()
+            }),
+        );
+
+        let options = options_for_provider_ref(&config, "anthropic", &fallback);
+        assert_eq!(options.cache_ttl, None);
+        assert!(!options.cache_passthrough);
+        // Root-scoped `[multimodal]` keeps its bare-ref inheritance.
+        assert_eq!(options.multimodal.max_images, 1);
+
+        // Dotted control: an explicit alias entry still resolves with its
+        // own cache settings, not the fallback alias's.
+        config.providers.models.anthropic.insert(
+            "direct".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    cache_ttl: Some(CacheTtl::FiveMinutes),
+                    cache_passthrough: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let dotted = options_for_provider_ref(&config, "anthropic.direct", &fallback);
+        assert_eq!(dotted.cache_ttl, Some(CacheTtl::FiveMinutes));
+        assert!(!dotted.cache_passthrough);
+    }
+
+    #[test]
     fn openai_responses_alias_honors_configured_vision_capability() {
         use zeroclaw_config::schema::{
             Config, ModelProviderConfig, OpenAIModelProviderConfig, WireApi,
@@ -3094,6 +3182,54 @@ mod tests {
         };
         let resolved = options_for_provider_ref(&Config::default(), "llamacpp", &fallback);
         assert_eq!(resolved.vision, None);
+    }
+
+    #[test]
+    fn options_for_bare_provider_ref_does_not_inherit_fallback_reasoning_effort_passthrough() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
+        // A bare family ref must not inherit the fallback provider's
+        // `reasoning_effort_passthrough` opt-in: the flag is a per-entry
+        // choice on a verified backend, and a bare family has no entry. The
+        // provider-agnostic `reasoning_effort` value itself survives the
+        // projection.
+        let fallback = ModelProviderRuntimeOptions {
+            reasoning_effort: Some("high".to_string()),
+            reasoning_effort_passthrough: true,
+            ..Default::default()
+        };
+        let resolved = options_for_provider_ref(&Config::default(), "llamacpp", &fallback);
+        assert!(
+            !resolved.reasoning_effort_passthrough,
+            "bare family ref must drop the fallback alias's passthrough opt-in"
+        );
+        assert_eq!(
+            resolved.reasoning_effort.as_deref(),
+            Some("high"),
+            "the global reasoning_effort value is provider-agnostic and survives"
+        );
+
+        // The dotted direction keeps the entry's own explicit choice: an
+        // opted-in alias stays opted in even when the fallback (primary)
+        // options carry `false`.
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "gw".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    reasoning_effort_passthrough: true,
+                    ..Default::default()
+                },
+            },
+        );
+        let fallback_off = ModelProviderRuntimeOptions {
+            reasoning_effort_passthrough: false,
+            ..Default::default()
+        };
+        let dotted = options_for_provider_ref(&config, "openai.gw", &fallback_off);
+        assert!(
+            dotted.reasoning_effort_passthrough,
+            "dotted ref resolves its own entry's opt-in, not the fallback's"
+        );
     }
 
     #[test]
@@ -3396,6 +3532,130 @@ mod tests {
             .take()
             .expect("server should capture request");
         assert_eq!(model, "new-model");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_passthrough_config_to_wire_isolates_bare_family_refs() {
+        use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+        use serde_json::{Value, json};
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        type Capture = Arc<Mutex<Option<String>>>;
+
+        async fn capture_chat_request(
+            State(capture): State<Capture>,
+            Json(body): Json<Value>,
+        ) -> (StatusCode, Json<Value>) {
+            let effort = body
+                .get("reasoning_effort")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            *capture.lock().expect("capture lock poisoned") = effort;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "choices": [{"message": {"content": "ok"}}]
+                })),
+            )
+        }
+
+        let capture: Capture = Arc::new(Mutex::new(None));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture_chat_request))
+            .with_state(capture.clone());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.runtime.reasoning_effort = Some("high".to_string());
+        config.providers.models.openai.insert(
+            "gw".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    kind: Some("openai-compatible".to_string()),
+                    uri: Some(format!("http://{addr}/v1")),
+                    api_key: Some("sk-test".to_string()),
+                    reasoning_effort_passthrough: true,
+                    ..Default::default()
+                },
+            },
+        );
+        // Config-to-wire proof for the opted-in alias: the runtime effort
+        // setting, the entry's opt-in, and the factory dispatch all have to
+        // line up for `reasoning_effort` to reach a non-OpenAI model name.
+        let options = provider_runtime_options_for_alias(&config, "openai", "gw");
+        let provider = create_routed_model_provider_with_options(
+            &config,
+            "openai.gw",
+            Some("sk-test"),
+            Some(&format!("http://{addr}/v1")),
+            &config.reliability,
+            &[],
+            "glm-5.3",
+            &options,
+        )
+        .expect("provider should build");
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        provider
+            .chat(request, "glm-5.3", None)
+            .await
+            .expect("chat should succeed");
+        let first = capture.lock().expect("capture lock poisoned").take();
+        assert_eq!(
+            first.as_deref(),
+            Some("high"),
+            "opted-in alias must forward the runtime effort to a non-OpenAI model"
+        );
+
+        // Provider isolation on the wire: the same agent options projected
+        // onto a bare compatible family must drop the opt-in (the flag is
+        // per-entry), so a bare family route keeps the default model-name
+        // filter and sends no effort. llama.cpp stands in for any bare
+        // compatible family here: a bare `openai` ref dispatches to the
+        // native OpenAI chat provider, which never applies runtime
+        // reasoning_effort, so the isolation would be unobservable there.
+        let bare_options = options_for_provider_ref(&config, "llamacpp", &options);
+        assert!(!bare_options.reasoning_effort_passthrough);
+        let bare_provider = create_routed_model_provider_with_options(
+            &config,
+            "llamacpp",
+            None,
+            Some(&format!("http://{addr}/v1")),
+            &config.reliability,
+            &[],
+            "glm-5.3",
+            &bare_options,
+        )
+        .expect("bare provider should build");
+        let bare_request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        bare_provider
+            .chat(bare_request, "glm-5.3", None)
+            .await
+            .expect("bare chat should succeed");
+        let second = capture.lock().expect("capture lock poisoned").take();
+        assert_eq!(
+            second, None,
+            "bare family route must not inherit the alias's passthrough opt-in"
+        );
+
         server.abort();
     }
 
@@ -4448,6 +4708,17 @@ mod tests {
         assert!(!result.contains("hunter2secret"), "{result}");
         assert!(!result.contains("region=us"), "{result}");
         assert!(result.contains("HTTPS://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_removes_complete_url_fragment() {
+        let input =
+            "GET https://api.example.com/v1/models#access_token=fragment-secret-value failed";
+        let result = sanitize_api_error(input);
+
+        assert!(!result.contains("fragment-secret-value"), "{result}");
+        assert!(!result.contains("#access_token="), "{result}");
+        assert!(result.contains("https://api.example.com/v1/models"));
     }
 
     #[test]

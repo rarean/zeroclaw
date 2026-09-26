@@ -10,9 +10,9 @@ use zeroclaw_providers::multimodal::ImageMarkerDisposition;
 use zeroclaw_providers::multimodal::image_marker_dispositions;
 use zeroclaw_providers::multimodal::image_marker_summary;
 
-/// Default trigger for auto-compaction when non-system message count exceeds this threshold.
-/// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
-/// used when callers omit the parameter.
+/// Default complete-turn retention limit. Prefer passing the config-driven
+/// value via `run_tool_call_loop`; this constant is only used when callers omit
+/// the parameter. The name is retained for config compatibility.
 pub const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
 
 pub(crate) static LOCAL_IMAGE_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -355,17 +355,33 @@ fn estimate_message_tokens(message: &ChatMessage, disposition: ImageMarkerDispos
 /// Estimate token count for a message history using the ~4 chars/token
 /// heuristic plus ~4 framing tokens per message. Loadable image markers are
 /// charged per image only where preparation dispatches them: user turns and
-/// the latest run of tool results. Stale tool-result markers are priced as
-/// their remaining text, and system or assistant content is priced as text.
-/// Trim probes estimate history suffixes that always retain the newest turn,
-/// so the latest tool-result run carries the same disposition in every probe
-/// as in the full history.
+/// the tool-result carriers in the current user turn. Stale tool-result
+/// markers are priced as their remaining text, and system or assistant
+/// content is priced as text. Trim probes estimate history suffixes that
+/// always retain the newest turn, so the current turn's tool-result carriers
+/// carry the same disposition in every probe as in the full history.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     let dispositions = image_marker_dispositions(history);
     history
         .iter()
         .zip(dispositions)
         .map(|(message, disposition)| estimate_message_tokens(message, disposition))
+        .sum()
+}
+
+/// Estimate the token cost of native tool definitions serialized into the
+/// provider request, using the same ~4 chars/token heuristic as messages.
+/// The OpenAI and compatible adapters serialize these schemas into the chat
+/// request, so providers that include them in `input_tokens` report a
+/// population of messages plus tool schemas, not messages alone.
+pub fn estimate_tool_schema_tokens(specs: &[crate::tools::ToolSpec]) -> usize {
+    specs
+        .iter()
+        .map(|spec| {
+            let parameters_len =
+                serde_json::to_string(&*spec.parameters).map_or(0, |serialized| serialized.len());
+            (spec.name.len() + spec.description.len() + parameters_len).div_ceil(4) + 4
+        })
         .sum()
 }
 
@@ -432,63 +448,28 @@ pub fn append_or_merge_system_message(history: &mut Vec<ChatMessage>, content: i
     normalize_system_messages(history);
 }
 
-pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    let has_system = history.first().is_some_and(|m| m.role == "system");
-    let non_system_count = if has_system {
-        history.len() - 1
-    } else {
-        history.len()
-    };
-
-    if non_system_count <= max_history {
-        return;
-    }
-
-    let system_offset = usize::from(has_system);
-
-    // Find the first user message (the framing anchor). If `max_history` is
-    // too small to fit both the anchor and any recent context, fall back to
-    // the old tail-only behaviour rather than producing a degenerate window.
-    let anchor_idx = history
-        .iter()
-        .enumerate()
-        .skip(system_offset)
-        .find(|(_, m)| m.role == "user")
-        .map(|(i, _)| i);
-
-    let messages_before = history.len();
-
-    let dropped_range = match anchor_idx {
-        Some(anchor) if max_history >= 2 => {
-            // Reserve one slot for the anchor; keep `max_history - 1` most recent.
-            let tail_keep = max_history - 1;
-            let tail_start = history.len().saturating_sub(tail_keep);
-            // Middle range to drop: (anchor + 1) .. tail_start.
-            let drop_start = anchor + 1;
-            if tail_start <= drop_start {
-                // Anchor is already inside the tail window — nothing in the
-                // middle to drop. Fall through to plain head-drop below.
-                None
-            } else {
-                Some(drop_start..tail_start)
-            }
-        }
-        _ => None,
-    };
-
-    if let Some(range) = dropped_range {
-        history.drain(range);
-    } else {
-        // No anchor, or `max_history < 2`: original head-drop behaviour.
-        let to_remove = non_system_count - max_history;
-        history.drain(system_offset..system_offset + to_remove);
-    }
-
-    remove_orphaned_tool_messages(history);
-    normalize_system_messages(history);
-
-    let dropped = messages_before.saturating_sub(history.len());
-    if dropped > 0 {
+pub fn trim_history(
+    history: &mut Vec<ChatMessage>,
+    max_history_turns: usize,
+    history_has_trim_breadcrumb: &mut bool,
+) {
+    let result = crate::agent::history_trim::trim_to_recent_turn_count(
+        std::mem::take(history),
+        max_history_turns,
+        *history_has_trim_breadcrumb,
+    );
+    let crate::agent::history_trim::TurnCountTrimResult {
+        history: trimmed_history,
+        dropped_messages,
+        dropped_turns,
+        kept_turns,
+        trimmed,
+    } = result;
+    let messages_before = trimmed_history.len().saturating_add(dropped_messages);
+    *history = trimmed_history;
+    if trimmed {
+        remove_orphaned_tool_messages(history);
+        normalize_system_messages(history);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -496,13 +477,12 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
                 .with_attrs(::serde_json::json!({
                     "messages_before": messages_before,
                     "messages_after": history.len(),
-                    "dropped": dropped,
-                    "max_history": max_history,
-                    "kept_anchor": anchor_idx.is_some() && max_history >= 2,
+                    "dropped_messages": dropped_messages,
+                    "dropped_turns": dropped_turns,
+                    "kept_turns": kept_turns,
+                    "max_history_turns": max_history_turns,
                 })),
-            "trim_history fired: middle of conversation dropped. Raise \
-             [runtime_profiles.<name>] max_history_messages or enable \
-             compact_context to avoid silent context loss."
+            "trim_history: dropped oldest whole turns"
         );
     }
 }
@@ -511,13 +491,16 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
 pub struct InteractiveSessionState {
     pub version: u32,
     pub history: Vec<ChatMessage>,
+    #[serde(default)]
+    pub history_has_trim_breadcrumb: bool,
 }
 
 impl InteractiveSessionState {
-    fn from_history(history: &[ChatMessage]) -> Self {
+    pub fn from_history_with_crumb(history: &[ChatMessage], has_crumb: bool) -> Self {
         Self {
-            version: 1,
+            version: 2,
             history: history.to_vec(),
+            history_has_trim_breadcrumb: has_crumb,
         }
     }
 }
@@ -526,8 +509,50 @@ pub fn load_interactive_session_history(
     path: &Path,
     system_prompt: &str,
 ) -> Result<Vec<ChatMessage>> {
+    let (history, _) = load_interactive_session_history_with_crumb(path, system_prompt)?;
+    Ok(history)
+}
+
+/// Canonical breadcrumb text used for trim markers. This is the English
+/// string that has been stable across all locales; it is the locale-
+/// independent anchor for legacy migration. Injected breadcrumbs are always
+/// produced via `get_required_cli_string("history-trim-breadcrumb")`, which
+/// currently resolves to this same English text in every locale. Checking
+/// the canonical value makes restore independent of the current process
+/// locale.
+pub const HISTORY_TRIM_BREADCRUMB_CANONICAL: &str =
+    "[earlier turns omitted to fit the context window]";
+
+pub fn is_history_trim_breadcrumb_text(text: &str) -> bool {
+    if text == HISTORY_TRIM_BREADCRUMB_CANONICAL {
+        return true;
+    }
+    // Best-effort cross-locale coverage: if a future translation changes the
+    // breadcrumb in a non-English locale, a legacy v1 file trimmed in that
+    // locale will still be recognised after a restart with a different locale.
+    // v2 files carry an explicit flag and never reach this path.
+    text == crate::i18n::get_required_cli_string("history-trim-breadcrumb")
+}
+
+/// Load interactive history plus the persisted breadcrumb provenance. Legacy
+/// files without the flag are migrated by inspecting the restored history:
+/// if the first non-system message equals the breadcrumb string, the flag is
+/// recovered as true. v2 records carry an explicit
+/// `history_has_trim_breadcrumb` (true or false) so a genuine user message
+/// that collides with the breadcrumb text keeps its real turn-boundary role.
+/// Legacy v1 migration is locale-independent: it checks the canonical
+/// English breadcrumb plus the current-locale string, covering both the
+/// stable historical value and any future translated variant. A v1 file whose
+/// first user turn genuinely equals the breadcrumb text cannot be
+/// distinguished from a synthetic marker on its one-time migration; after the
+/// next persist the file becomes v2 with the (mis)classified flag, which is
+/// the documented one-time limitation for unmarked legacy state.
+pub fn load_interactive_session_history_with_crumb(
+    path: &Path,
+    system_prompt: &str,
+) -> Result<(Vec<ChatMessage>, bool)> {
     if !path.exists() {
-        return Ok(vec![ChatMessage::system(system_prompt)]);
+        return Ok((vec![ChatMessage::system(system_prompt)], false));
     }
 
     let raw = std::fs::read_to_string(path)?;
@@ -544,15 +569,45 @@ pub fn load_interactive_session_history(
 
     remove_orphaned_tool_messages(&mut state.history);
 
-    Ok(state.history)
+    // Migration: only legacy v1 files lack explicit provenance. v2 records
+    // carry an explicit `history_has_trim_breadcrumb` (true or false) — a
+    // fresh v2 session where the user legitimately sent the breadcrumb text
+    // must not be reclassified as synthetic. Infer only when the persisted
+    // version is < 2 and the flag is false.
+    let mut has_crumb = state.history_has_trim_breadcrumb;
+    if !has_crumb && state.version < 2 {
+        let leading_system = state
+            .history
+            .iter()
+            .take_while(|m| m.role == "system")
+            .count();
+        if let Some(first) = state.history.get(leading_system)
+            && first.role == "user"
+            && is_history_trim_breadcrumb_text(&first.content)
+        {
+            has_crumb = true;
+        }
+    }
+
+    Ok((state.history, has_crumb))
 }
 
 pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
+    save_interactive_session_history_with_crumb(path, history, false)
+}
+
+pub fn save_interactive_session_history_with_crumb(
+    path: &Path,
+    history: &[ChatMessage],
+    has_crumb: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
+    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history_with_crumb(
+        history, has_crumb,
+    ))?;
     std::fs::write(path, payload)?;
     Ok(())
 }
@@ -741,6 +796,21 @@ mod tests {
         assert_eq!(
             latest_tool_tokens - stale_tool_tokens,
             30 * IMAGE_TOKEN_ESTIMATE
+        );
+    }
+
+    #[test]
+    fn estimate_tool_schema_tokens_counts_name_description_and_parameters() {
+        let spec = crate::tools::ToolSpec::new(
+            "search",
+            "search the corpus",
+            serde_json::json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        );
+        let tokens = estimate_tool_schema_tokens(&[spec]);
+        assert!(tokens > 0, "a tool schema must contribute tokens");
+        assert!(
+            estimate_tool_schema_tokens(&[]) == 0,
+            "no tools means no schema tokens"
         );
     }
 

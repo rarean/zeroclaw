@@ -318,6 +318,7 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
 #[derive(Debug)]
 struct HistoryTrimNotice {
     dropped_messages: usize,
+    dropped_turns: usize,
     kept_turns: usize,
     reason: String,
 }
@@ -326,8 +327,16 @@ impl HistoryTrimNotice {
     fn into_turn_event(self) -> TurnEvent {
         TurnEvent::HistoryTrimmed {
             dropped_messages: self.dropped_messages,
+            dropped_turns: self.dropped_turns,
             kept_turns: self.kept_turns,
             reason: self.reason,
+            // Message-limit trims carry no token accounting.
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
         }
     }
 }
@@ -356,10 +365,10 @@ pub struct Agent {
     /// as `TurnMemory.cfg` on every turn.
     memory_inject_cfg: crate::agent::memory_inject::MemoryInjectConfig,
     config: zeroclaw_config::schema::AliasedAgentConfig,
-    /// Resolves the structured-history cap from canonical config at use time.
+    /// Resolves the structured-history turn limit from canonical config at use time.
     /// Daemon-backed sessions capture the shared live config handle so reloads
     /// affect existing sessions without duplicating config-derived state.
-    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    structured_history_turn_limit_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     /// Resolves limits from canonical config for the provider/model route that
     /// is active when a turn starts. The route itself remains the source of truth.
     context_limits_resolver: Option<ContextLimitsResolver>,
@@ -383,6 +392,7 @@ pub struct Agent {
     /// True only when `history` contains the synthetic trim breadcrumb inserted
     /// by this Agent. User text is never inferred to be synthetic by content.
     history_has_trim_breadcrumb: bool,
+    history_trim_generation: u64,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     /// The exact immutable route table used by `model_provider` for hint
     /// dispatch. It is replaced atomically with the provider on model switch.
@@ -413,11 +423,15 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    /// Pre-rendered MCP pinned-resource system-prompt section, read once at
-    /// construction from each server's `pinned_resources` and provenance-wrapped
-    /// (`trust="untrusted-external"`). Empty when no pins are configured or all
-    /// were skipped. Appended to the system prompt in `build_system_prompt`.
-    mcp_pinned_section: String,
+    tool_search: Option<Arc<crate::tools::ToolSearchTool>>,
+    /// MCP pinned resources, read once at construction from each server's
+    /// `pinned_resources` and provenance-wrapped (`trust="untrusted-external"`).
+    /// Kept as attributed blocks rather than pre-rendered text so a later
+    /// principal tool narrowing can withdraw a block whose `<server>__<uri>`
+    /// key the selector no longer names; `build_system_prompt` renders what
+    /// remains. Empty when no pins are configured, all were skipped, or all
+    /// were pruned.
+    mcp_pinned: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
     mcp_deferred_section: String,
     /// Hook runner for tool-call auditing and lifecycle side effects.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
@@ -441,7 +455,7 @@ pub struct Agent {
     /// Channel name stamped onto observer events to identify the calling surface
     /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
     channel_name: String,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     /// The `DelegateTool` this Agent's registry registered, in its concrete
     /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
@@ -582,7 +596,7 @@ pub struct AgentBuilder {
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
-    structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    structured_history_turn_limit_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
     context_limits_resolver: Option<ContextLimitsResolver>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
@@ -605,7 +619,7 @@ pub struct AgentBuilder {
     shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
-    mcp_pinned_section: Option<String>,
+    mcp_pinned: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
     mcp_deferred_section: Option<String>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     approval_manager: Option<Arc<ApprovalManager>>,
@@ -614,7 +628,7 @@ pub struct AgentBuilder {
     exclude_memory: bool,
     provider_switch_config: Option<ProviderSwitchConfig>,
     config_generation: Option<ConfigGeneration>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
     #[cfg(test)]
     delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
@@ -625,6 +639,12 @@ impl Default for AgentBuilder {
         Self::new()
     }
 }
+
+/// Key given to a pinned section supplied through the deprecated
+/// [`AgentBuilder::mcp_pinned_section`]. It is deliberately not a legal
+/// `<server>__<uri>` tool name, so a principal's allowed-tool list can never
+/// contain it and `Agent::narrow_to_principal_tools` always prunes the block.
+const UNATTRIBUTED_PINNED_KEY: &str = "\0unattributed-pinned-section";
 
 impl AgentBuilder {
     pub fn new() -> Self {
@@ -637,7 +657,7 @@ impl AgentBuilder {
             tool_dispatcher: None,
             memory_inject_cfg: None,
             config: None,
-            structured_history_cap_resolver: None,
+            structured_history_turn_limit_resolver: None,
             context_limits_resolver: None,
             multimodal_config: None,
             model_name: None,
@@ -660,7 +680,7 @@ impl AgentBuilder {
             shell_profile: None,
             approval_route: None,
             activated_tools: None,
-            mcp_pinned_section: None,
+            mcp_pinned: Vec::new(),
             mcp_deferred_section: None,
             hook_runner: None,
             approval_manager: None,
@@ -669,7 +689,7 @@ impl AgentBuilder {
             config_generation: None,
             exclude_memory: false,
             provider_switch_config: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             turn_datetime: None,
             #[cfg(test)]
             delegate_tool: None,
@@ -730,11 +750,11 @@ impl AgentBuilder {
         self
     }
 
-    fn structured_history_cap_resolver(
+    fn structured_history_turn_limit_resolver(
         mut self,
         resolver: Arc<dyn Fn() -> usize + Send + Sync>,
     ) -> Self {
-        self.structured_history_cap_resolver = Some(resolver);
+        self.structured_history_turn_limit_resolver = Some(resolver);
         self
     }
 
@@ -744,8 +764,8 @@ impl AgentBuilder {
     }
 
     #[cfg(test)]
-    fn structured_max_history_messages(self, max: usize) -> Self {
-        self.structured_history_cap_resolver(Arc::new(move || max))
+    fn structured_max_history_turns(self, max: usize) -> Self {
+        self.structured_history_turn_limit_resolver(Arc::new(move || max))
     }
 
     pub fn multimodal_config(
@@ -887,8 +907,43 @@ impl AgentBuilder {
         self
     }
 
+    pub fn mcp_pinned_blocks(
+        mut self,
+        blocks: Vec<zeroclaw_tools::mcp_context::PinnedResourceBlock>,
+    ) -> Self {
+        self.mcp_pinned = blocks;
+        self
+    }
+
+    /// Compatibility setter for callers built against the pre-attribution
+    /// signature, which took the rendered section as one string.
+    ///
+    /// The string carries no `<server>__<uri>` attribution, so it cannot be
+    /// matched against a principal's allowed tool names. Restoring it as plain
+    /// text would let construction-time content outlive a narrowing that no
+    /// longer grants it, which is the leak the attributed blocks exist to
+    /// close. It is therefore wrapped in a block keyed with
+    /// `UNATTRIBUTED_PINNED_KEY`, a name no allowed-tool list can contain,
+    /// so `narrow_to_principal_tools` prunes it on the first narrowing. A
+    /// caller that never narrows (the unscoped constructions this setter
+    /// exists for) sees the section exactly as before.
+    ///
+    /// Prefer [`Self::mcp_pinned_blocks`]: it keeps content revocable per
+    /// resource instead of dropping all of it at the first narrowing.
+    #[deprecated(
+        note = "pass attributed blocks via mcp_pinned_blocks; an unattributed section is pruned whenever a principal selector narrows the session"
+    )]
     pub fn mcp_pinned_section(mut self, section: Option<String>) -> Self {
-        self.mcp_pinned_section = section;
+        self.mcp_pinned = section
+            .filter(|rendered| !rendered.trim().is_empty())
+            .map(
+                |rendered| zeroclaw_tools::mcp_context::PinnedResourceBlock {
+                    key: UNATTRIBUTED_PINNED_KEY.to_string(),
+                    rendered,
+                },
+            )
+            .into_iter()
+            .collect();
         self
     }
 
@@ -1048,7 +1103,7 @@ impl AgentBuilder {
                 )
             }),
             config,
-            structured_history_cap_resolver: self.structured_history_cap_resolver,
+            structured_history_turn_limit_resolver: self.structured_history_turn_limit_resolver,
             context_limits_resolver: self.context_limits_resolver,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name,
@@ -1076,6 +1131,7 @@ impl AgentBuilder {
             memory_session_id: self.memory_session_id,
             history: Vec::new(),
             history_has_trim_breadcrumb: false,
+            history_trim_generation: 0,
             classification_config: self.classification_config.unwrap_or_default(),
             model_route_resolver,
             response_cache: self.response_cache,
@@ -1090,7 +1146,8 @@ impl AgentBuilder {
             inject_memory: !exclude_memory,
             shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
-            mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
+            tool_search: None,
+            mcp_pinned: self.mcp_pinned,
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
             hook_runner: self.hook_runner,
             approval_manager: self.approval_manager,
@@ -1100,7 +1157,7 @@ impl AgentBuilder {
             config_generation: self.config_generation,
             provider_switch_config: self.provider_switch_config,
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             turn_datetime: self.turn_datetime,
             #[cfg(test)]
             delegate_tool: self.delegate_tool,
@@ -1108,9 +1165,35 @@ impl AgentBuilder {
     }
 }
 
+/// Identifies the single message in a replayed buffer that actually
+/// received the provider-only recalled-memory preamble. The injector
+/// targets one message (the last user message at injection time); every
+/// other buffer a turn replays is either a pre-injection clone that never
+/// contained the preamble or a slice positioned after it. Callers pass the
+/// target only for the mutated history buffer, at the index the injected
+/// message holds within the exact slice being replayed — never for
+/// uninjected clones, which must replay byte-for-byte.
+struct MemoryPreambleTarget<'a> {
+    preamble: &'a str,
+    index: usize,
+}
+
 impl Agent {
     pub fn builder() -> AgentBuilder {
         AgentBuilder::new()
+    }
+
+    /// Install a deterministic clock for downstream test fixtures.
+    ///
+    /// This method is available only to the crate's own tests or when the
+    /// dev-only `test-util` feature is enabled. Production builds always use
+    /// the live local clock.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_turn_datetime_for_test<F>(&mut self, provider: F)
+    where
+        F: Fn() -> chrono::DateTime<chrono::Local> + Send + Sync + 'static,
+    {
+        self.turn_datetime = Some(Arc::new(provider));
     }
 
     /// The full `Config` the agent was constructed from, when available. Sourced
@@ -1137,7 +1220,7 @@ impl Agent {
     }
 
     fn current_turn_datetime(&self) -> chrono::DateTime<chrono::Local> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
         if let Some(provider) = &self.turn_datetime {
             return provider();
         }
@@ -1347,6 +1430,18 @@ impl Agent {
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.history_has_trim_breadcrumb = false;
+    }
+
+    pub fn set_history_has_trim_breadcrumb(&mut self, flag: bool) {
+        self.history_has_trim_breadcrumb = flag;
+    }
+
+    pub fn history_has_trim_breadcrumb(&self) -> bool {
+        self.history_has_trim_breadcrumb
+    }
+
+    pub fn history_trim_generation(&self) -> u64 {
+        self.history_trim_generation
     }
 
     fn encode_response_cache_transcript(messages: &[ChatMessage]) -> String {
@@ -1572,6 +1667,43 @@ impl Agent {
         }
     }
 
+    /// Apply a current principal tool ceiling to an existing session. This is
+    /// intentionally narrowing-only: session construction already intersects
+    /// the principal and agent policies, while a later policy refresh must
+    /// never let an old static or activated tool survive a removed grant.
+    ///
+    /// Pinned MCP resource content is governed by the same selector: each
+    /// block was admitted at assembly under its `<server>__<uri>` name, so a
+    /// narrowing that no longer names it withdraws the block from every later
+    /// prompt rather than letting construction-time text outlive its grant.
+    pub fn narrow_to_principal_tools(&mut self, allowed: Option<&[String]>) {
+        let Some(allowed) = allowed else {
+            return;
+        };
+        self.tools
+            .retain(|tool| allowed.iter().any(|name| name == tool.name()));
+        if let Some(search) = &self.tool_search {
+            search.narrow_to_caller(allowed);
+        }
+        if let Some(activated) = &self.activated_tools {
+            // A poisoned lock must not preserve a revoked executable tool.
+            activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain_allowed(allowed);
+        }
+        self.mcp_pinned.retain(|block| allowed.contains(&block.key));
+        self.disable_principal_unaware_nested_tools();
+    }
+
+    /// Nested builders do not yet carry the RPC principal's two selectors.
+    /// Refuse only those entry points, not the correctly narrowed parent turn.
+    pub(crate) fn disable_principal_unaware_nested_tools(&mut self) {
+        self.tools
+            .retain(|tool| !tool.requires_unrestricted_principal());
+        self.refresh_system_prompt();
+    }
+
     #[cfg(test)]
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.iter().map(|t| t.name()).collect()
@@ -1580,6 +1712,37 @@ impl Agent {
     #[cfg(test)]
     pub fn system_prompt_for_test(&self) -> Result<String> {
         self.build_system_prompt()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn dispatch_tool_for_test(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> super::tool_execution::ToolExecutionOutcome {
+        super::tool_execution::execute_one_tool(
+            name,
+            args,
+            Some("principal-test-call"),
+            super::tool_execution::ToolDispatchContext {
+                tools_registry: &self.tools,
+                activated_tools: self.activated_tools.as_ref(),
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &super::turn::TurnMeta {
+                agent_alias: Some(&self.agent_alias),
+                parent_agent_alias: None,
+                turn_id: "principal-test-turn",
+                channel_name: "rpc",
+            },
+            self.observer.as_ref(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("production dispatch returns a tool outcome")
     }
 
     #[cfg(test)]
@@ -1597,7 +1760,7 @@ impl Agent {
     }
 
     /// Hydrate prior chat messages and return a transport event when restoring
-    /// the history enforces the structured message cap.
+    /// the history enforces the structured whole-turn limit.
     pub fn seed_history_with_event(&mut self, messages: &[ChatMessage]) -> Option<TurnEvent> {
         if self.history.is_empty()
             && let Ok(sys) = self.build_system_prompt()
@@ -1623,7 +1786,7 @@ impl Agent {
     }
 
     /// Hydrate structured conversation history and return a transport event
-    /// when restoring the history enforces the structured message cap.
+    /// when restoring the history enforces the structured whole-turn limit.
     pub fn seed_conversation_history_with_event(
         &mut self,
         messages: Vec<ConversationMessage>,
@@ -1683,6 +1846,7 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1710,6 +1874,7 @@ impl Agent {
             sop_engine,
             sop_audit,
             canvas_store,
+            None,
             None,
             None,
             None,
@@ -1742,6 +1907,7 @@ impl Agent {
             sop_audit,
             canvas_store,
             Some(acp_session_store),
+            None,
             None,
             None,
         )
@@ -1777,6 +1943,7 @@ impl Agent {
             canvas_store,
             None,
             Some(live_config),
+            None,
             None,
         )
         .await
@@ -1837,6 +2004,7 @@ impl Agent {
             Some(acp_session_store),
             Some(live_config),
             None,
+            None,
         )
         .await
     }
@@ -1871,12 +2039,14 @@ impl Agent {
             None,
             None,
             None,
+            None,
         )
         .await
     }
 
     /// Build a daemon-backed TUI Agent whose structured-history cap follows
     /// the shared config after reloads.
+    #[allow(clippy::too_many_arguments)]
     pub async fn from_live_config_with_tui_env(
         live_config: Arc<parking_lot::RwLock<Config>>,
         agent_alias: &str,
@@ -1886,6 +2056,34 @@ impl Agent {
         tui_env: Option<std::collections::HashMap<String, String>>,
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
+    ) -> Result<Self> {
+        Self::from_live_config_with_tui_env_and_principal_tools(
+            live_config,
+            agent_alias,
+            session_cwd,
+            initialize_mcp,
+            exclude_memory,
+            tui_env,
+            sop_engine,
+            sop_audit,
+            None,
+        )
+        .await
+    }
+
+    /// Additive RPC constructor. The shared resolver owns grants; this argument
+    /// is only the current assembly ceiling, not a long-lived policy snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_live_config_with_tui_env_and_principal_tools(
+        live_config: Arc<parking_lot::RwLock<Config>>,
+        agent_alias: &str,
+        session_cwd: Option<&Path>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        tui_env: Option<std::collections::HashMap<String, String>>,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         // Stack-budget boundary for the daemon-backed construction paths
         // (`session/new`, rehydration, plugin agents). The whole incarnation
@@ -1921,6 +2119,7 @@ impl Agent {
                 None,
                 Some(Arc::clone(&live_config)),
                 Some(live_config),
+                principal_allowed_tools,
             ))
         })
         .await
@@ -1940,6 +2139,7 @@ impl Agent {
         sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
         sop_audit: Option<Arc<SopAuditLogger>>,
         acp_session_store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+        principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         let handle = tokio::runtime::Handle::current();
         let agent_alias = agent_alias.to_string();
@@ -1961,6 +2161,7 @@ impl Agent {
                 Some(acp_session_store),
                 Some(Arc::clone(&live_config)),
                 Some(live_config),
+                principal_allowed_tools,
             ))
         })
         .await
@@ -1983,6 +2184,11 @@ impl Agent {
         acp_session_store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
         live_config: Option<Arc<parking_lot::RwLock<Config>>>,
         live_model_config: Option<Arc<parking_lot::RwLock<Config>>>,
+        // The caller principal's tool selector (RFC 7141 composition by
+        // intersection): `None` = unrestricted, `Some(list)` keeps only the
+        // named tools from the assembled surface (empty = a tool-less
+        // agent). Fed by the RPC dispatcher from the resolved grants.
+        principal_allowed_tools: Option<Vec<String>>,
     ) -> Result<Self> {
         let agent_cfg = config
             .agent(agent_alias)
@@ -2086,6 +2292,7 @@ impl Agent {
                 // engine with a real channel-delivering adapter instead.
                 let (engine, audit) = crate::sop::build_sop_engine(
                     config.sop.clone(),
+                    &config.decision_models,
                     &config.data_dir,
                     &config.install_root_dir(),
                     mem,
@@ -2147,7 +2354,13 @@ impl Agent {
                 built: all_tools_result,
                 skills: &skills,
                 runtime,
-                caller_allowed: None,
+                // The principal's tool selector must gate deferred/MCP
+                // tools too, not only the static registry narrowed by
+                // `.allowed_tools()` below. `caller_allowed` is exact-match
+                // (no `<server>__<tool>` auto-admit escape), so an empty
+                // principal list denies every MCP tool and a named list
+                // admits only the named ones.
+                caller_allowed: principal_allowed_tools.as_deref(),
                 connect_mcp: initialize_mcp,
                 connect_peripherals: false,
                 exclude_memory,
@@ -2163,14 +2376,15 @@ impl Agent {
         )
         .await;
         // The Agent injects two distinct MCP prompt slots: `mcp_deferred_section` (the
-        // deferred tool-search listing) and `mcp_pinned_section` (pinned resources).
+        // deferred tool-search listing) and `mcp_pinned` (pinned resources, kept as
+        // attributed blocks so live narrowing can prune them).
         // `assemble` surfaces the two atomically, so from_config threads each into its
         // own slot below - no duplication, and the deferred advertisement the
         // regression suite asserts is preserved.
         let deferred_section = assembled.deferred_section().to_string();
-        let pinned_section = assembled.pinned_section().to_string();
+        let pinned_blocks = assembled.pinned_blocks().to_vec();
         let crate::tools::scoped::ScopedAssembled {
-            registry,
+            mut registry,
             delegate_handle: _,
             ask_user_handle,
             reaction_handle,
@@ -2178,11 +2392,19 @@ impl Agent {
             escalate_handle,
             channel_room_handle,
             activated_handle,
+            tool_search_handle,
             // from_config performs no per-turn tool_filter_groups filtering
             // itself, so mcp_tool_names is dropped here along with `registry`'s
             // already-consumed sibling fields via `..`.
             ..
         } = assembled;
+        // Nested delegation has no principal-agent ceiling parameter yet. A
+        // constrained principal can still use its correctly narrowed session,
+        // but cannot enter either bounded or independent delegation and lose
+        // that ceiling.
+        if principal_allowed_tools.is_some() {
+            registry.retain(|tool| !tool.requires_unrestricted_principal());
+        }
         // Thread the sealed registry straight to the builder - `.tools(...)` now
         // takes a `ScopedToolRegistry`, so no `into_inner()` unwrap here.
         let tools = registry;
@@ -2273,7 +2495,7 @@ impl Agent {
                 })
             };
 
-        let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
+        let structured_history_turn_limit_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
             if let Some(cap_config) = live_config {
                 let cap_agent_alias = agent_alias.to_string();
                 Arc::new(move || {
@@ -2291,6 +2513,7 @@ impl Agent {
         let builder = builder.delegate_tool(built_delegate_tool);
         let mut builder = builder
             .model_provider(model_provider)
+            .allowed_tools(principal_allowed_tools)
             .tools(tools)
             .memory(memory.clone())
             .observer(observer)
@@ -2309,7 +2532,7 @@ impl Agent {
                     .resolved_agent_config(agent_alias)
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
-            .structured_history_cap_resolver(structured_history_cap_resolver)
+            .structured_history_turn_limit_resolver(structured_history_turn_limit_resolver)
             .context_limits_resolver(context_limits_resolver)
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
@@ -2335,7 +2558,7 @@ impl Agent {
             .approval_route(risk_profile.approval_route.clone())
             .activated_tools(activated_handle)
             .mcp_deferred_section(Some(deferred_section))
-            .mcp_pinned_section(Some(pinned_section))
+            .mcp_pinned_blocks(pinned_blocks)
             .hook_runner(if config.hooks.enabled {
                 Some(Arc::new(crate::hooks::HookRunner::from_config(
                     &config.hooks,
@@ -2360,6 +2583,8 @@ impl Agent {
         }
         let mut agent = builder.build()?;
 
+        agent.tool_search = tool_search_handle;
+
         // Wire per-tool channel-map handles into the agent so callers (e.g.
         // the ACP server) can register back-channels after construction.
         agent.channel_handles = AgentChannelHandles {
@@ -2374,18 +2599,15 @@ impl Agent {
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
-        let max = self
-            .structured_history_cap_resolver
+        let max_turns = self
+            .structured_history_turn_limit_resolver
             .as_ref()
             .map_or(self.config.resolved.max_history_messages, |resolve| {
                 resolve()
             });
-        if self.history.len() <= max {
-            return None;
-        }
         let result = crate::agent::history_trim::trim_conversation_to_recent_turns(
             std::mem::take(&mut self.history),
-            max,
+            max_turns,
             self.history_has_trim_breadcrumb,
         );
         self.history = result.history;
@@ -2395,6 +2617,7 @@ impl Agent {
 
         crate::agent::history_trim::insert_conversation_breadcrumb(&mut self.history);
         self.history_has_trim_breadcrumb = true;
+        self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
         let reason = crate::i18n::get_required_cli_string("history-trim-reason-message-cap");
         let channel = self.channel_name.clone();
         let agent_alias = self.observer_agent_alias();
@@ -2421,7 +2644,7 @@ impl Agent {
                     .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
-                        "max_history_messages": max,
+                        "max_history_turns": max_turns,
                         "dropped_messages": result.dropped_messages,
                         "dropped_turns": result.dropped_turns,
                         "kept_turns": result.kept_turns,
@@ -2438,10 +2661,18 @@ impl Agent {
             channel: Some(channel),
             agent_alias,
             turn_id,
+            // Message-limit trims carry no token accounting.
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
         });
 
         Some(HistoryTrimNotice {
             dropped_messages: result.dropped_messages,
+            dropped_turns: result.dropped_turns,
             kept_turns: result.kept_turns,
             reason,
         })
@@ -2599,13 +2830,23 @@ impl Agent {
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
         }
-        if !self.mcp_deferred_section.is_empty() {
+        let deferred_section = if self.tools.iter().any(|tool| tool.name() == "tool_search") {
+            self.tool_search.as_ref().map_or_else(
+                || self.mcp_deferred_section.clone(),
+                |search| search.deferred_prompt_section(),
+            )
+        } else {
+            String::new()
+        };
+        if !deferred_section.is_empty() {
             prompt.push_str("\n\n");
-            prompt.push_str(&self.mcp_deferred_section);
+            prompt.push_str(&deferred_section);
         }
-        if !self.mcp_pinned_section.is_empty() {
+        let pinned_section =
+            zeroclaw_tools::mcp_context::render_pinned_resources_section(&self.mcp_pinned);
+        if !pinned_section.is_empty() {
             prompt.push_str("\n\n");
-            prompt.push_str(&self.mcp_pinned_section);
+            prompt.push_str(&pinned_section);
         }
         Ok(prompt)
     }
@@ -2679,11 +2920,18 @@ impl Agent {
             .and_then(|cfg| cfg.config.as_ref())
         {
             Some(full_config) => {
-                let agent_entry = full_config
+                let target_entry = new_model_provider
+                    .split_once('.')
+                    .and_then(|(family, alias)| full_config.providers.models.find(family, alias));
+                // A dotted target profile is the canonical source of endpoint
+                // and credentials. Falling back to the current agent profile is
+                // only retained for legacy bare-family switch requests.
+                let current_agent_entry = full_config
                     .resolved_model_provider_for_agent(&self.agent_alias)
                     .map(|(_ty, _alias, entry)| entry);
-                let default_api_key = agent_entry.and_then(|e| e.api_key.as_deref());
-                let default_base_url = agent_entry.and_then(|e| e.uri.as_deref());
+                let target_or_current = target_entry.or(current_agent_entry);
+                let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
+                let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
 
                 // Prefer a route-specific api_key when the switched
                 // provider/model matches a configured model_route entry.
@@ -2779,7 +3027,41 @@ impl Agent {
         self.model_name.clone()
     }
 
-    fn replay_loop_messages(loop_messages: &[ChatMessage]) -> Vec<ConversationMessage> {
+    fn replay_loop_messages(
+        loop_messages: &[ChatMessage],
+        injected: Option<MemoryPreambleTarget<'_>>,
+    ) -> Vec<ConversationMessage> {
+        // The turn engine injects the recalled-memory preamble onto the last
+        // user message (`turn::mod.rs`'s `memory` handling, which records the
+        // exact rendered block) for this turn's provider request only; it
+        // must never land in durable/canonical history, which every call
+        // site of this function feeds.
+        //
+        // The strip is positional, never content-discovered: only
+        // `injected.index` is considered, and only when that message is
+        // still a user-role message starting with the recorded preamble.
+        // Inferring the target from text instead — scanning every message
+        // for the preamble, even from the end — silently changes genuine
+        // history in two reachable cases. First, the no-trim and streamed
+        // callers replay pre-injection canonical clones alongside the
+        // recorded preamble; when the user's original text starts with that
+        // exact block, any content match strips genuine content from a
+        // buffer the injector never touched (those callers now pass `None`).
+        // Second, steering input appends newer user messages after the
+        // injected one, so a reverse scan can select the steering message,
+        // damaging it while leaving the injected memory in place. An older
+        // genuine message equal to the block is likewise never considered.
+        //
+        // The content confirmation is belt-and-braces, not discovery: it
+        // covers the trim dropping the injected message itself (the preamble
+        // leaves with it, so there is nothing to clean) without touching an
+        // unrelated message that shifted into the recorded position.
+        let strip_at = injected.as_ref().and_then(|target| {
+            loop_messages
+                .get(target.index)
+                .filter(|msg| msg.role == "user" && msg.content.starts_with(target.preamble))
+                .map(|_| target.index)
+        });
         let mut replayed: Vec<ConversationMessage> = Vec::with_capacity(loop_messages.len());
         let push_tool_results = |replayed: &mut Vec<ConversationMessage>,
                                  results: Vec<ToolResultMessage>| {
@@ -2789,7 +3071,7 @@ impl Agent {
                 replayed.push(ConversationMessage::ToolResults(results));
             }
         };
-        for msg in loop_messages {
+        for (index, msg) in loop_messages.iter().enumerate() {
             if msg.role == "assistant"
                 && let Ok(serde_json::Value::Object(obj)) =
                     serde_json::from_str::<serde_json::Value>(&msg.content)
@@ -2878,7 +3160,21 @@ impl Agent {
                     continue;
                 }
             }
-            replayed.push(ConversationMessage::Chat(msg.clone()));
+            let stripped = if strip_at == Some(index) {
+                crate::agent::memory_inject::strip_memory_context_preamble(
+                    &msg.content,
+                    injected.as_ref().map(|target| target.preamble),
+                )
+            } else {
+                msg.content.as_str()
+            };
+            if stripped.len() == msg.content.len() {
+                replayed.push(ConversationMessage::Chat(msg.clone()));
+            } else {
+                let mut msg = msg.clone();
+                msg.content = stripped.to_string();
+                replayed.push(ConversationMessage::Chat(msg));
+            }
         }
         replayed
     }
@@ -3027,6 +3323,12 @@ impl Agent {
             .rposition(|m| m.role == "user")
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
+        let original_loop_history_len = loop_history.len();
+        let original_loop_history_crumb = self.history_has_trim_breadcrumb;
+        // Seed raw-transcript crumb provenance from the structured history's
+        // owner-tracked state (the conversion preserves the crumb position).
+        let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
+        let mut loop_injected_memory_preamble: Option<String> = None;
         let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -3054,89 +3356,93 @@ impl Agent {
             Some(cost_context.clone()),
             crate::agent::tool_receipts::scope_receipts(
                 receipt_scope.clone(),
-                crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                    exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
-                        crate::agent::loop_::ResolvedModelAccess {
-                            model_provider: self.model_provider.as_ref(),
-                            provider_name: &selected_route.provider_name,
-                            model: &selected_route.model,
-                            dispatch_model: &effective_model,
-                            temperature: self.temperature,
-                        },
-                        crate::agent::loop_::ResolvedIo {
-                            tools_registry: &self.tools,
-                            observer: self.observer.as_ref(),
-                            silent: false,
-                            approval: self.approval_manager.as_deref(),
-                            multimodal_config: &self.multimodal_config,
-                            // Inlined `full_config()` (per-field borrow) so it coexists with
-                            // the `&mut self.image_cache` in this same ToolLoop expression.
-                            config: self
-                                .provider_switch_config
-                                .as_ref()
-                                .and_then(|c| c.config.as_deref()),
-                            hooks: self.hook_runner.as_deref(),
-                            activated_tools: self.activated_tools.as_ref(),
-                            model_switch_callback: None,
-                            receipt_generator: receipt_scope
-                                .as_ref()
-                                .map(crate::agent::tool_receipts::ReceiptScope::generator),
-                        },
-                        crate::agent::loop_::ResolvedRuntimeKnobs {
-                            max_tool_iterations: self.config.resolved.max_tool_iterations,
-                            excluded_tools: &[],
-                            dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                            pacing: &pacing,
-                            strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                            parallel_tools: self.config.resolved.parallel_tools,
-                            max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                            context_limits,
-                            context_limits_resolver: self.context_limits_resolver.clone(),
-                            knobs: &knobs,
-                        },
-                    ),
-                    history: &mut loop_history,
-                    channel_name: &self.channel_name,
-                    channel_reply_target: None,
-                    cancellation_token: None,
-                    on_delta: None,
-                    shared_budget: None,
-                    channel: None,
-                    collected_receipts: receipt_scope
-                        .as_ref()
-                        .map(crate::agent::tool_receipts::ReceiptScope::collector),
-                    event_tx: None,
-                    steering: None,
-                    new_messages_out: Some(&mut loop_new_messages),
-                    image_cache: Some(&mut self.image_cache),
-                    // Direct embedded Agent::turn call; source/transport/
-                    // trust stay placeholders, not yet stamped at the edge.
-                    memory: Some(crate::agent::memory_inject::TurnMemory {
-                        handle: self.memory.as_ref(),
-                        query: user_message.to_string(),
-                        sessions: vec![self.memory_session_id.clone()],
-                        suppress: false,
-                        cfg: self.memory_inject_cfg,
-                    }),
-                    ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
-                    agent_alias: agent_alias_for_loop.as_deref(),
-                    parent_agent_alias: None,
-                    turn_id: &turn_id,
-                    // Non-streamed `Agent::turn` returns text, not a
-                    // terminal `StreamedTurnSuccess`, so it publishes no
-                    // route snapshot.
-                    served_route_sink: None,
-                    // Live-daemon SOP path: re-assemble a nested step's agent
-                    // when it delegates elsewhere. Config survives only via
-                    // `provider_switch_config`; with `None` (test builder) a
-                    // cross-agent step FAILS CLOSED rather than inheriting
-                    // this turn's context.
-                    sop_reassembly: self
-                        .provider_switch_config
-                        .as_ref()
-                        .and_then(|c| c.config.as_deref())
-                        .map(|config| crate::agent::turn::SopStepReassembly { config }),
-                }),
+                Box::pin(crate::agent::loop_::run_tool_call_loop(
+                    crate::agent::loop_::ToolLoop {
+                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                            crate::agent::loop_::ResolvedModelAccess {
+                                model_provider: self.model_provider.as_ref(),
+                                provider_name: &selected_route.provider_name,
+                                model: &selected_route.model,
+                                dispatch_model: &effective_model,
+                                temperature: self.temperature,
+                            },
+                            crate::agent::loop_::ResolvedIo {
+                                tools_registry: &self.tools,
+                                observer: self.observer.as_ref(),
+                                silent: false,
+                                approval: self.approval_manager.as_deref(),
+                                multimodal_config: &self.multimodal_config,
+                                // Inlined `full_config()` (per-field borrow) so it coexists with
+                                // the `&mut self.image_cache` in this same ToolLoop expression.
+                                config: self
+                                    .provider_switch_config
+                                    .as_ref()
+                                    .and_then(|c| c.config.as_deref()),
+                                hooks: self.hook_runner.as_deref(),
+                                activated_tools: self.activated_tools.as_ref(),
+                                model_switch_callback: None,
+                                receipt_generator: receipt_scope
+                                    .as_ref()
+                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                            },
+                            crate::agent::loop_::ResolvedRuntimeKnobs {
+                                max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                excluded_tools: &[],
+                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
+                                pacing: &pacing,
+                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                parallel_tools: self.config.resolved.parallel_tools,
+                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
+                                context_limits,
+                                context_limits_resolver: self.context_limits_resolver.clone(),
+                                knobs: &knobs,
+                            },
+                        ),
+                        history: &mut loop_history,
+                        history_has_trim_breadcrumb: &mut loop_history_crumb_present,
+                        injected_memory_preamble: &mut loop_injected_memory_preamble,
+                        channel_name: &self.channel_name,
+                        channel_reply_target: None,
+                        cancellation_token: None,
+                        on_delta: None,
+                        shared_budget: None,
+                        channel: None,
+                        collected_receipts: receipt_scope
+                            .as_ref()
+                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: Some(&mut loop_new_messages),
+                        image_cache: Some(&mut self.image_cache),
+                        // Direct embedded Agent::turn call; source/transport/
+                        // trust stay placeholders, not yet stamped at the edge.
+                        memory: Some(crate::agent::memory_inject::TurnMemory {
+                            handle: self.memory.as_ref(),
+                            query: user_message.to_string(),
+                            sessions: vec![self.memory_session_id.clone()],
+                            suppress: false,
+                            cfg: self.memory_inject_cfg,
+                        }),
+                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                        agent_alias: agent_alias_for_loop.as_deref(),
+                        parent_agent_alias: None,
+                        turn_id: &turn_id,
+                        // Non-streamed `Agent::turn` returns text, not a
+                        // terminal `StreamedTurnSuccess`, so it publishes no
+                        // route snapshot.
+                        served_route_sink: None,
+                        // Live-daemon SOP path: re-assemble a nested step's agent
+                        // when it delegates elsewhere. Config survives only via
+                        // `provider_switch_config`; with `None` (test builder) a
+                        // cross-agent step FAILS CLOSED rather than inheriting
+                        // this turn's context.
+                        sop_reassembly: self
+                            .provider_switch_config
+                            .as_ref()
+                            .and_then(|c| c.config.as_deref())
+                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                    },
+                )),
             ),
         );
         // Context-window recovery can change the provider-visible transcript
@@ -3187,11 +3493,54 @@ impl Agent {
                 None,
             );
         }
-        // Pop the original user message (pushed before the loop) so the
-        // replayed canonical version, including the original user message.
-        self.history.pop();
-        for replayed in Self::replay_loop_messages(&loop_new_messages) {
-            self.history.push(replayed);
+        // Write back any token-budget trim that happened inside the loop to
+        // durable history. `loop_history` is the TurnState's history which
+        // after `sync_pending` already contains the canonical current turn
+        // (user+assistant...), so `loop_history.len()` includes both the
+        // prefix and the canonical. To detect a trim we must compare only
+        // the prefix part, not the full length which always grows via
+        // `sync_pending` and tool appends.
+        let new_prefix_len = loop_history.len().saturating_sub(loop_new_messages.len());
+        let history_trimmed_in_loop = new_prefix_len != original_loop_history_len
+            || loop_history_crumb_present != original_loop_history_crumb;
+        if history_trimmed_in_loop {
+            // The loop's history is already the authoritative full transcript
+            // (trimmed prefix + canonical). It already contains the user and
+            // assistant messages, so we can replay it directly without
+            // appending `loop_new_messages` a second time — doing so duplicated
+            // the current turn (5 messages instead of 3).
+            //
+            // This is the mutated history buffer, the only one that can
+            // carry the injected preamble: the current turn's user message
+            // opens the canonical tail, which starts at `new_prefix_len`.
+            // The positional confirmation inside replay still verifies the
+            // message before stripping it.
+            let injected =
+                loop_injected_memory_preamble
+                    .as_deref()
+                    .map(|preamble| MemoryPreambleTarget {
+                        preamble,
+                        index: new_prefix_len,
+                    });
+            self.history.clear();
+            self.history
+                .extend(Self::replay_loop_messages(&loop_history, injected));
+            self.history_has_trim_breadcrumb = loop_history_crumb_present;
+            self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
+        } else {
+            // No trim: the loop did not change the prefix. Pop the pre-loop
+            // enriched user message and replay the canonical (which may be the
+            // request-enriched form, not the raw `enriched` we pushed).
+            // `loop_new_messages` is a pre-injection clone the loop's memory
+            // injection never touches (it mutates `loop_history` in place,
+            // and only ever pushes to this buffer, never replaces it), so
+            // no strip target is passed: an uninjected clone must replay
+            // byte-for-byte even when the user's original text starts with
+            // the recorded preamble.
+            self.history.pop();
+            for replayed in Self::replay_loop_messages(&loop_new_messages, None) {
+                self.history.push(replayed);
+            }
         }
         let response = match loop_result {
             Ok(response) => response,
@@ -3461,7 +3810,17 @@ impl Agent {
             .rposition(|m| m.role == "user")
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
+        let mut streamed_original_loop_history_len = loop_history.len();
+        let mut streamed_original_crumb = self.history_has_trim_breadcrumb;
+        // Seed raw-transcript crumb provenance from the structured history's
+        // owner-tracked state (the conversion preserves the crumb position).
+        let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
+        let mut loop_injected_memory_preamble: Option<String> = None;
         let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
+        // Track total canonical ChatMessage length so prefix detection is not
+        // confused by `sync_pending` which always grows `loop_history` via the
+        // canonical. After each round, prefix_len = loop_history.len() - total_canonical_len.
+        let mut total_canonical_len = 0usize;
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
                 Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
@@ -3562,97 +3921,107 @@ impl Agent {
                 Some(cost_context.clone()),
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
-                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                        exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
-                            crate::agent::loop_::ResolvedModelAccess {
-                                model_provider: self.model_provider.as_ref(),
-                                provider_name: &selected_route.provider_name,
-                                model: &selected_route.model,
-                                dispatch_model: &effective_model,
-                                temperature: self.temperature,
-                            },
-                            crate::agent::loop_::ResolvedIo {
-                                tools_registry: &self.tools,
-                                observer: self.observer.as_ref(),
-                                silent: true,
-                                approval: self.approval_manager.as_deref(),
-                                multimodal_config: &self.multimodal_config,
-                                // Inlined `full_config()` (per-field borrow) so it coexists with
-                                // the `&mut self.image_cache` in this same ToolLoop expression.
-                                config: self
-                                    .provider_switch_config
-                                    .as_ref()
-                                    .and_then(|c| c.config.as_deref()),
-                                hooks: self.hook_runner.as_deref(),
-                                activated_tools: self.activated_tools.as_ref(),
-                                // `None` here (rather than a shared global) is
-                                // deliberate: `run_tool_call_loop` mints a fresh,
-                                // task-local switch state for this round when it
-                                // sees `None`, so a `model_switch` requested this
-                                // round can never leak into a sibling round or a
-                                // concurrently running turn/agent.
-                                model_switch_callback: None,
-                                receipt_generator: receipt_scope
-                                    .as_ref()
-                                    .map(crate::agent::tool_receipts::ReceiptScope::generator),
-                            },
-                            crate::agent::loop_::ResolvedRuntimeKnobs {
-                                max_tool_iterations: self.config.resolved.max_tool_iterations,
-                                excluded_tools: &[],
-                                dedup_exempt_tools: &self.config.resolved.tool_call_dedup_exempt,
-                                pacing: &pacing,
-                                strict_tool_parsing: self.config.resolved.strict_tool_parsing,
-                                parallel_tools: self.config.resolved.parallel_tools,
-                                max_tool_result_chars: self.config.resolved.max_tool_result_chars,
-                                // Fallback pair for the loop when no resolver is
-                                // wired; when `context_limits_resolver` is set
-                                // the loop re-resolves per call, so seed with the
-                                // resolver-free config limits instead of invoking
-                                // the resolver a second time here.
-                                context_limits: self.config.resolved.context_limits(),
-                                context_limits_resolver: self.context_limits_resolver.clone(),
-                                knobs: &knobs,
-                            },
-                        ),
-                        history: &mut loop_history,
-                        channel_name: &self.channel_name,
-                        channel_reply_target: None,
-                        cancellation_token: cancel_token.clone(),
-                        on_delta: None,
-                        shared_budget: None,
-                        channel: approval_bridge.as_deref(),
-                        collected_receipts: receipt_scope
-                            .as_ref()
-                            .map(crate::agent::tool_receipts::ReceiptScope::collector),
-                        event_tx: Some(event_tx.clone()),
-                        steering: None,
-                        new_messages_out: Some(&mut round_added),
-                        image_cache: Some(&mut self.image_cache),
-                        // Direct embedded Agent::turn call; source/transport/
-                        // trust stay placeholders, not yet stamped at the edge.
-                        memory: Some(crate::agent::memory_inject::TurnMemory {
-                            handle: self.memory.as_ref(),
-                            query: user_message.to_string(),
-                            sessions: vec![self.memory_session_id.clone()],
-                            suppress: false,
-                            cfg: self.memory_inject_cfg,
-                        }),
-                        ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
-                        agent_alias: agent_alias_for_loop.as_deref(),
-                        parent_agent_alias: None,
-                        turn_id: &turn_id,
-                        served_route_sink: Some(served_route_sink.clone()),
-                        // Live-daemon SOP path: re-assemble a nested step's
-                        // agent when it delegates elsewhere. Config survives
-                        // only via `provider_switch_config`; with `None`
-                        // (test builder) a cross-agent step FAILS CLOSED
-                        // rather than inheriting this turn's context.
-                        sop_reassembly: self
-                            .provider_switch_config
-                            .as_ref()
-                            .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
-                    }),
+                    Box::pin(crate::agent::loop_::run_tool_call_loop(
+                        crate::agent::loop_::ToolLoop {
+                            exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
+                                crate::agent::loop_::ResolvedModelAccess {
+                                    model_provider: self.model_provider.as_ref(),
+                                    provider_name: &selected_route.provider_name,
+                                    model: &selected_route.model,
+                                    dispatch_model: &effective_model,
+                                    temperature: self.temperature,
+                                },
+                                crate::agent::loop_::ResolvedIo {
+                                    tools_registry: &self.tools,
+                                    observer: self.observer.as_ref(),
+                                    silent: true,
+                                    approval: self.approval_manager.as_deref(),
+                                    multimodal_config: &self.multimodal_config,
+                                    // Inlined `full_config()` (per-field borrow) so it coexists with
+                                    // the `&mut self.image_cache` in this same ToolLoop expression.
+                                    config: self
+                                        .provider_switch_config
+                                        .as_ref()
+                                        .and_then(|c| c.config.as_deref()),
+                                    hooks: self.hook_runner.as_deref(),
+                                    activated_tools: self.activated_tools.as_ref(),
+                                    // `None` here (rather than a shared global) is
+                                    // deliberate: `run_tool_call_loop` mints a fresh,
+                                    // task-local switch state for this round when it
+                                    // sees `None`, so a `model_switch` requested this
+                                    // round can never leak into a sibling round or a
+                                    // concurrently running turn/agent.
+                                    model_switch_callback: None,
+                                    receipt_generator: receipt_scope
+                                        .as_ref()
+                                        .map(crate::agent::tool_receipts::ReceiptScope::generator),
+                                },
+                                crate::agent::loop_::ResolvedRuntimeKnobs {
+                                    max_tool_iterations: self.config.resolved.max_tool_iterations,
+                                    excluded_tools: &[],
+                                    dedup_exempt_tools: &self
+                                        .config
+                                        .resolved
+                                        .tool_call_dedup_exempt,
+                                    pacing: &pacing,
+                                    strict_tool_parsing: self.config.resolved.strict_tool_parsing,
+                                    parallel_tools: self.config.resolved.parallel_tools,
+                                    max_tool_result_chars: self
+                                        .config
+                                        .resolved
+                                        .max_tool_result_chars,
+                                    // Fallback pair for the loop when no resolver is
+                                    // wired; when `context_limits_resolver` is set
+                                    // the loop re-resolves per call, so seed with the
+                                    // resolver-free config limits instead of invoking
+                                    // the resolver a second time here.
+                                    context_limits: self.config.resolved.context_limits(),
+                                    context_limits_resolver: self.context_limits_resolver.clone(),
+                                    knobs: &knobs,
+                                },
+                            ),
+                            history: &mut loop_history,
+                            history_has_trim_breadcrumb: &mut loop_history_crumb_present,
+                            injected_memory_preamble: &mut loop_injected_memory_preamble,
+                            channel_name: &self.channel_name,
+                            channel_reply_target: None,
+                            cancellation_token: cancel_token.clone(),
+                            on_delta: None,
+                            shared_budget: None,
+                            channel: approval_bridge.as_deref(),
+                            collected_receipts: receipt_scope
+                                .as_ref()
+                                .map(crate::agent::tool_receipts::ReceiptScope::collector),
+                            event_tx: Some(event_tx.clone()),
+                            steering: None,
+                            new_messages_out: Some(&mut round_added),
+                            image_cache: Some(&mut self.image_cache),
+                            // Direct embedded Agent::turn call; source/transport/
+                            // trust stay placeholders, not yet stamped at the edge.
+                            memory: Some(crate::agent::memory_inject::TurnMemory {
+                                handle: self.memory.as_ref(),
+                                query: user_message.to_string(),
+                                sessions: vec![self.memory_session_id.clone()],
+                                suppress: false,
+                                cfg: self.memory_inject_cfg,
+                            }),
+                            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+                            agent_alias: agent_alias_for_loop.as_deref(),
+                            parent_agent_alias: None,
+                            turn_id: &turn_id,
+                            served_route_sink: Some(served_route_sink.clone()),
+                            // Live-daemon SOP path: re-assemble a nested step's
+                            // agent when it delegates elsewhere. Config survives
+                            // only via `provider_switch_config`; with `None`
+                            // (test builder) a cross-agent step FAILS CLOSED
+                            // rather than inheriting this turn's context.
+                            sop_reassembly: self
+                                .provider_switch_config
+                                .as_ref()
+                                .and_then(|c| c.config.as_deref())
+                                .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        },
+                    )),
                 ),
             );
             // Scope the provider-fallback task-local around the round so the
@@ -3718,9 +4087,44 @@ impl Agent {
                 self.history.pop();
                 new_msgs.pop();
             }
-            for replayed in Self::replay_loop_messages(&round_added) {
+            // `round_added` is a pre-injection clone the loop's memory
+            // injection never touches (it mutates `loop_history` in place,
+            // once, before round 0, and only ever pushes to the canonical
+            // buffer), so no strip target is passed here either: even the
+            // round-0 user message it carries for a single tool-free
+            // exchange is the clean clone, and must replay byte-for-byte.
+            for replayed in Self::replay_loop_messages(&round_added, None) {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
+            }
+            total_canonical_len += round_added.len();
+            // Write back durable token-budget trim from loop_history.
+            // `loop_history` after this round is [trimmed_prefix + all canonical ChatMessages so far]
+            // `total_canonical_len` tracks the ChatMessage length of all canonical so far,
+            // so prefix_len = loop_history.len() - total_canonical_len.
+            let new_prefix_len = loop_history.len().saturating_sub(total_canonical_len);
+            if new_prefix_len != streamed_original_loop_history_len
+                || loop_history_crumb_present != streamed_original_crumb
+            {
+                // The prefix was trimmed (old turns dropped or crumb inserted).
+                // Rebuild durable history from the authoritative loop_history
+                // which already contains the trimmed prefix + canonical. As
+                // above, this is the mutated buffer: the injected message,
+                // when retained, opens the canonical tail at `new_prefix_len`.
+                let injected =
+                    loop_injected_memory_preamble
+                        .as_deref()
+                        .map(|preamble| MemoryPreambleTarget {
+                            preamble,
+                            index: new_prefix_len,
+                        });
+                self.history.clear();
+                self.history
+                    .extend(Self::replay_loop_messages(&loop_history, injected));
+                self.history_has_trim_breadcrumb = loop_history_crumb_present;
+                self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
+                streamed_original_loop_history_len = new_prefix_len;
+                streamed_original_crumb = loop_history_crumb_present;
             }
 
             match loop_result {
@@ -3827,7 +4231,7 @@ impl Agent {
                     // assistant output (e.g. a persisted stream partial) when
                     // no prior round committed anything.
                     if committed_response.is_empty() {
-                        for replayed in Self::replay_loop_messages(&round_added) {
+                        for replayed in Self::replay_loop_messages(&round_added, None) {
                             if let ConversationMessage::Chat(message) = &replayed
                                 && message.role == "assistant"
                             {
@@ -4054,6 +4458,197 @@ mod tests {
 
         assert_eq!(provider_ref, "openai.fast");
         assert_eq!(model, "gpt-4o-mini");
+    }
+
+    /// Regression: trim write-back must never persist the provider-only
+    /// recalled-memory preamble the turn engine injects onto the last user
+    /// message. `replay_loop_messages` feeds every durable-history write-back
+    /// call site, so stripping it there covers both the buffered and
+    /// streamed trim paths. The strip target carries the injected message's
+    /// index within the replayed (mutated history) buffer.
+    #[test]
+    fn replay_loop_messages_strips_the_memory_context_preamble() {
+        let preamble = format!(
+            "{}\n- k: recalled fact\n{}\n\n",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        );
+        let with_preamble = ChatMessage::user(format!("{preamble}what's the weather like"));
+        let assistant = ChatMessage::assistant("it's sunny".to_string());
+        let replayed = Agent::replay_loop_messages(
+            &[with_preamble, assistant],
+            Some(MemoryPreambleTarget {
+                preamble: preamble.as_str(),
+                index: 0,
+            }),
+        );
+
+        let ConversationMessage::Chat(user_msg) = &replayed[0] else {
+            panic!(
+                "expected the user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(user_msg.content, "what's the weather like");
+        assert!(
+            !user_msg
+                .content
+                .contains(zeroclaw_memory::MEMORY_CONTEXT_OPEN),
+            "durable history must never carry the recalled-memory preamble"
+        );
+    }
+
+    /// Regression: a genuine user message that merely starts with the same
+    /// marker text as a recalled-memory preamble must survive byte-for-byte
+    /// when no length was recorded for it — provenance is the caller's own
+    /// record of what it injected, never a match against the marker text.
+    #[test]
+    fn replay_loop_messages_preserves_a_user_message_that_looks_like_a_preamble() {
+        let looks_like_a_preamble = ChatMessage::user(format!(
+            "{}\n- k: a user-authored fact\n{}\n\nplease keep this text",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        ));
+        let original = looks_like_a_preamble.content.clone();
+        let replayed = Agent::replay_loop_messages(&[looks_like_a_preamble], None);
+
+        let ConversationMessage::Chat(user_msg) = &replayed[0] else {
+            panic!(
+                "expected the user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(
+            user_msg.content, original,
+            "a genuine user message must survive byte-for-byte without a recorded preamble length"
+        );
+    }
+
+    /// Regression: the no-trim and streamed callers replay pre-injection
+    /// canonical clones (`loop_new_messages` / `round_added`) that the
+    /// loop's memory injection never touches. Those callers pass no strip
+    /// target, so replay is byte-for-byte even when the user's original
+    /// text starts with the exact recorded preamble — the case that
+    /// content-discovered stripping corrupted.
+    #[test]
+    fn replay_loop_messages_never_strips_an_uninjected_clone_even_when_text_collides() {
+        let preamble = format!(
+            "{}\n- k: recalled fact\n{}\n\n",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        );
+        // The user's genuine text starts with the exact recorded block, in
+        // a buffer the injector never touched.
+        let genuine = ChatMessage::user(format!("{preamble}my original question"));
+        let assistant = ChatMessage::assistant("answer 1".to_string());
+        let original = genuine.content.clone();
+
+        let replayed = Agent::replay_loop_messages(&[genuine, assistant], None);
+
+        let ConversationMessage::Chat(user_msg) = &replayed[0] else {
+            panic!(
+                "expected the user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(
+            user_msg.content, original,
+            "an uninjected clone must survive intact: clones carry no strip target"
+        );
+    }
+
+    /// Regression: an older genuine user message that happens to equal the
+    /// exact rendered preamble must survive write-back. Replay strips only
+    /// the recorded target position in the mutated history buffer — never a
+    /// content match anywhere else in the buffer.
+    #[test]
+    fn replay_loop_messages_strips_only_the_injected_user_message_when_an_older_one_collides() {
+        let preamble = format!(
+            "{}\n- k: recalled fact\n{}\n\n",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        );
+        // A genuine older turn quoting the exact recalled block verbatim.
+        let older_collision = ChatMessage::user(preamble.clone());
+        let injected = ChatMessage::user(format!("{preamble}current question"));
+        let assistant = ChatMessage::assistant("answer".to_string());
+        let replayed = Agent::replay_loop_messages(
+            &[older_collision, injected, assistant],
+            Some(MemoryPreambleTarget {
+                preamble: preamble.as_str(),
+                index: 1,
+            }),
+        );
+
+        assert_eq!(replayed.len(), 3);
+        let ConversationMessage::Chat(older_msg) = &replayed[0] else {
+            panic!(
+                "expected the older user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(
+            older_msg.content, preamble,
+            "an older genuine message matching the preamble must survive byte-for-byte"
+        );
+        let ConversationMessage::Chat(current_msg) = &replayed[1] else {
+            panic!(
+                "expected the injected user message to replay as Chat, got {:?}",
+                replayed[1]
+            );
+        };
+        assert_eq!(
+            current_msg.content, "current question",
+            "the injected message must still be stripped"
+        );
+    }
+
+    /// Regression: steering input appends newer user messages after the
+    /// injected one. Replay must strip the recorded target position only —
+    /// a later steering message starting with the same preamble block must
+    /// survive, and the injected memory must still be removed from the
+    /// original message.
+    #[test]
+    fn replay_loop_messages_preserves_a_later_steering_message_when_it_collides() {
+        let preamble = format!(
+            "{}\n- k: recalled fact\n{}\n\n",
+            zeroclaw_memory::MEMORY_CONTEXT_OPEN,
+            zeroclaw_memory::MEMORY_CONTEXT_CLOSE,
+        );
+        let injected = ChatMessage::user(format!("{preamble}current question"));
+        let assistant = ChatMessage::assistant("working on it".to_string());
+        // A steering follow-up that happens to start with the same block.
+        let steering = ChatMessage::user(format!("{preamble}steering follow-up"));
+        let steering_original = steering.content.clone();
+        let replayed = Agent::replay_loop_messages(
+            &[injected, assistant, steering],
+            Some(MemoryPreambleTarget {
+                preamble: preamble.as_str(),
+                index: 0,
+            }),
+        );
+
+        assert_eq!(replayed.len(), 3);
+        let ConversationMessage::Chat(current_msg) = &replayed[0] else {
+            panic!(
+                "expected the injected user message to replay as Chat, got {:?}",
+                replayed[0]
+            );
+        };
+        assert_eq!(
+            current_msg.content, "current question",
+            "the injected message must still be stripped"
+        );
+        let ConversationMessage::Chat(steering_msg) = &replayed[2] else {
+            panic!(
+                "expected the steering message to replay as Chat, got {:?}",
+                replayed[2]
+            );
+        };
+        assert_eq!(
+            steering_msg.content, steering_original,
+            "a later steering message must survive even when it starts with the preamble"
+        );
     }
 
     zeroclaw_api::mock_tool_attribution!(
@@ -6476,6 +7071,363 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn principal_turn_executes_permitted_tool_and_refuses_removed_tool() {
+        struct PrincipalNativeProvider(MockModelProvider);
+        #[async_trait]
+        impl ModelProvider for PrincipalNativeProvider {
+            fn supports_native_tools(&self) -> bool {
+                true
+            }
+            async fn chat_with_system(
+                &self,
+                system: Option<&str>,
+                message: &str,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> Result<String> {
+                self.0
+                    .chat_with_system(system, message, model, temperature)
+                    .await
+            }
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                temperature: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                self.0.chat(request, model, temperature).await
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PrincipalNativeProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                self.0.role()
+            }
+            fn alias(&self) -> &str {
+                "principal-native-fixture"
+            }
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response = |names: &[&str]| zeroclaw_providers::ChatResponse {
+            text: None,
+            tool_calls: names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| zeroclaw_providers::ToolCall {
+                    id: format!("call-{i}"),
+                    name: (*name).into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                })
+                .collect(),
+            usage: None,
+            reasoning_content: None,
+        };
+        let done = || zeroclaw_providers::ChatResponse {
+            text: Some("done".into()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        };
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(PrincipalNativeProvider(MockModelProvider {
+                responses: Mutex::new(vec![
+                    response(&["echo", "forbidden"]),
+                    done(),
+                    response(&["echo"]),
+                    done(),
+                ]),
+            })))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![
+                    Box::new(CountingTool {
+                        calls: Arc::clone(&calls),
+                    }),
+                    Box::new(NamedMockTool::new("forbidden")),
+                    Box::new(NamedMockTool::new("keep")),
+                ],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .unwrap();
+        agent.narrow_to_principal_tools(Some(&["echo".into(), "keep".into()]));
+        assert_eq!(agent.tool_names(), vec!["echo", "keep"]);
+        assert_eq!(agent.turn("first turn").await.unwrap(), "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(format!("{:?}", agent.history).contains("Unknown tool: forbidden"));
+        // Keep a harmless capability so the second turn still uses the tool
+        // protocol and must reject the model's request for the removed echo.
+        // Empty-surface behavior is covered by the RPC selector matrix.
+        agent.narrow_to_principal_tools(Some(&["keep".into()]));
+        assert_eq!(agent.tool_names(), vec!["keep"]);
+        assert_eq!(agent.turn("after revocation").await.unwrap(), "done");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "revoked tool must not execute again"
+        );
+        assert!(format!("{:?}", agent.history).contains("Unknown tool: echo"));
+    }
+
+    /// The deprecated `mcp_pinned_section` keeps pre-attribution callers
+    /// compiling, so it must still render their section. It carries no
+    /// `<server>__<uri>` attribution, so it cannot be matched against a
+    /// principal's allowed names: the first narrowing withdraws it instead of
+    /// letting construction-time text outlive the grant it was built under.
+    #[tokio::test]
+    async fn a_compatibility_pinned_section_renders_then_is_pruned_by_any_narrowing() {
+        let tmp = tempfile::tempdir().unwrap();
+        #[allow(deprecated)]
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(NamedMockTool::new("keep"))],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .mcp_pinned_section(Some("LEGACY-PINNED-CONTENT".to_string()))
+            .build()
+            .unwrap();
+
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(
+            prompt.contains("LEGACY-PINNED-CONTENT"),
+            "the compatibility setter must still render its section: {prompt}"
+        );
+
+        // Narrow with a list that also names every plausible attribution this
+        // section could be given. The block survives only if its key is one a
+        // grant can name, so this fails if the shim keys it like a real
+        // resource instead of with the unnameable sentinel.
+        agent.narrow_to_principal_tools(Some(&[
+            "keep".into(),
+            "docs__legacy".into(),
+            "legacy".into(),
+            "pinned".into(),
+            "mcp__pinned".into(),
+            "LEGACY-PINNED-CONTENT".into(),
+        ]));
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(
+            !prompt.contains("LEGACY-PINNED-CONTENT"),
+            "an unattributed section must not survive a principal narrowing: {prompt}"
+        );
+        assert!(!prompt.contains("## Pinned MCP Resources"), "{prompt}");
+        assert_eq!(agent.tool_names(), vec!["keep"]);
+
+        // The sentinel is unnameable by construction: a tool name reaches the
+        // allowed list from config and can never carry a NUL, so no grant can
+        // spell this key and retain the block.
+        assert!(
+            UNATTRIBUTED_PINNED_KEY.contains('\0'),
+            "the compatibility key must not be a legal tool name"
+        );
+    }
+
+    /// An empty or whitespace-only compatibility section adds no block, so it
+    /// cannot render an empty pinned heading.
+    #[tokio::test]
+    async fn a_blank_compatibility_pinned_section_adds_no_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        for blank in [None, Some(String::new()), Some("   \n".to_string())] {
+            #[allow(deprecated)]
+            let agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![Box::new(NamedMockTool::new("keep"))],
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::NoopObserver {}))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(tmp.path().to_path_buf())
+                .mcp_pinned_section(blank.clone())
+                .build()
+                .unwrap();
+            assert!(
+                !agent
+                    .system_prompt_for_test()
+                    .unwrap()
+                    .contains("## Pinned MCP Resources"),
+                "blank section {blank:?} must not render a pinned heading"
+            );
+        }
+    }
+
+    /// Pinned MCP resource text is admitted under the resource's
+    /// `<server>__<uri>` selector name. A later narrowing that drops the name
+    /// must withdraw the already-materialized block from every later prompt,
+    /// not only stop the executable tools.
+    #[tokio::test]
+    async fn narrowing_prunes_pinned_mcp_resources_from_later_prompts() {
+        use zeroclaw_tools::mcp_context::PinnedResourceBlock;
+        let tmp = tempfile::tempdir().unwrap();
+        let block = |key: &str, text: &str| PinnedResourceBlock {
+            key: key.into(),
+            rendered: format!(
+                "<mcp-resource server=\"docs\" uri=\"{key}\" mime=\"text/plain\" \
+                 trust=\"untrusted-external\">\n{text}\n</mcp-resource>"
+            ),
+        };
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(NamedMockTool::new("keep"))],
+            ))
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .mcp_pinned_blocks(vec![
+                block("docs__handbook", "HANDBOOK-CONTENT"),
+                block("docs__roster", "ROSTER-CONTENT"),
+            ])
+            .build()
+            .unwrap();
+
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(prompt.contains("## Pinned MCP Resources"));
+        assert!(prompt.contains("HANDBOOK-CONTENT") && prompt.contains("ROSTER-CONTENT"));
+
+        // Revoking one pinned resource withdraws exactly its block.
+        agent.narrow_to_principal_tools(Some(&["keep".into(), "docs__handbook".into()]));
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(
+            prompt.contains("HANDBOOK-CONTENT"),
+            "the still-granted resource stays pinned"
+        );
+        assert!(
+            !prompt.contains("ROSTER-CONTENT"),
+            "the revoked resource must not reach later prompts: {prompt}"
+        );
+
+        // A selector that names no pinned resource leaves no section at all,
+        // and narrowing never brings a pruned block back.
+        agent.narrow_to_principal_tools(Some(&["keep".into()]));
+        let prompt = agent.system_prompt_for_test().unwrap();
+        assert!(!prompt.contains("## Pinned MCP Resources"), "{prompt}");
+        assert!(!prompt.contains("HANDBOOK-CONTENT"));
+        agent.narrow_to_principal_tools(Some(&["keep".into(), "docs__roster".into()]));
+        assert!(
+            !agent
+                .system_prompt_for_test()
+                .unwrap()
+                .contains("ROSTER-CONTENT"),
+            "narrowing is narrowing-only; a pruned block is not re-admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn principal_nested_pipeline_skill_alias_cannot_bypass_ceiling() {
+        let mut agent = blank_input_agent(Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let echo: Arc<dyn Tool> = Arc::new(CountingTool {
+            calls: Arc::clone(&calls),
+        });
+        let pipeline: Arc<dyn Tool> = Arc::new(crate::tools::PipelineTool::with_access_policy(
+            zeroclaw_config::schema::PipelineConfig::default(),
+            vec![echo],
+            None,
+        ));
+        let skill = make_skill("wrapped", &["pipeline"]);
+        let wrapper = crate::tools::skill_tool::SkillBuiltinTool::new(
+            "wrapped",
+            &skill.tools[0],
+            Arc::clone(&pipeline),
+            HashMap::new(),
+        );
+        let wrapper_name = wrapper.name().to_owned();
+        agent.tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+            Box::new(crate::tools::ArcToolRef(pipeline)),
+            Box::new(wrapper),
+        ]);
+        assert_eq!(
+            agent.tool_names().len(),
+            2,
+            "both raw and wrapped entry points exist before narrowing"
+        );
+        agent.narrow_to_principal_tools(Some(&[
+            crate::tools::PipelineTool::NAME.into(),
+            wrapper_name.clone(),
+        ]));
+        assert!(agent.tool_names().is_empty());
+        for name in [crate::tools::PipelineTool::NAME, wrapper_name.as_str()] {
+            assert!(
+                !agent
+                    .dispatch_tool_for_test(
+                        name,
+                        serde_json::json!({"steps":[{"tool":"echo","args":{}}]})
+                    )
+                    .await
+                    .success
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn principal_poisoned_activated_set_is_pruned_before_dispatch() {
+        let mut agent = blank_input_agent(Box::new(MockModelProvider {
+            responses: Mutex::new(vec![]),
+        }));
+        let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+        for name in ["mcp__keep", "mcp__revoke"] {
+            activated
+                .lock()
+                .unwrap()
+                .activate(name.into(), Arc::new(NamedMockTool::new(name)));
+        }
+        agent.activated_tools = Some(Arc::clone(&activated));
+        assert!(
+            agent
+                .dispatch_tool_for_test("mcp__revoke", serde_json::json!({}))
+                .await
+                .success
+        );
+        let poison = Arc::clone(&activated);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poison.lock().unwrap();
+                panic!("test poison");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(activated.is_poisoned());
+        agent.narrow_to_principal_tools(Some(&["mcp__keep".into()]));
+        assert!(
+            agent
+                .dispatch_tool_for_test("mcp__keep", serde_json::json!({}))
+                .await
+                .success
+        );
+        assert!(
+            !agent
+                .dispatch_tool_for_test("mcp__revoke", serde_json::json!({}))
+                .await
+                .success
+        );
+        assert!(
+            !activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_activated("mcp__revoke")
+        );
+    }
+
+    #[tokio::test]
     async fn turn_without_tools_returns_text() {
         let model_provider = Box::new(MockModelProvider {
             responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
@@ -7799,10 +8751,10 @@ mod tests {
         let current = "11111111-1111-4111-8111-111111111111";
         let previous = "22222222-2222-4222-8222-222222222222";
         store
-            .create_session(current, "test-agent", "/current")
+            .create_session(current, "test-agent", "/current", None)
             .unwrap();
         store
-            .create_session(previous, "test-agent", "/previous")
+            .create_session(previous, "test-agent", "/previous", None)
             .unwrap();
         store
             .append_turn(
@@ -8215,7 +9167,7 @@ mod tests {
     fn seed_history_trims_over_cap_restore_and_returns_transport_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
 
         let event = agent.seed_history_with_event(&[
             ChatMessage::user("old request"),
@@ -8255,7 +9207,7 @@ mod tests {
 
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(4, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         let event = agent.seed_conversation_history_with_event(vec![
             ConversationMessage::Chat(ChatMessage::user("old request")),
             ConversationMessage::Chat(ChatMessage::assistant("old answer")),
@@ -8307,7 +9259,7 @@ mod tests {
     #[test]
     fn clear_history_resets_trim_breadcrumb_provenance_before_reuse() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
             ConversationMessage::Chat(ChatMessage::user("old user")),
@@ -8355,7 +9307,7 @@ mod tests {
     #[test]
     fn append_seed_history_preserves_existing_trim_breadcrumb_provenance() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.seed_history(&[
             ChatMessage::user("old user"),
             ChatMessage::assistant("old assistant"),
@@ -8392,7 +9344,7 @@ mod tests {
     #[test]
     fn append_conversation_seed_preserves_existing_trim_breadcrumb_provenance() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.seed_conversation_history(vec![
             ConversationMessage::Chat(ChatMessage::user("old user")),
             ConversationMessage::Chat(ChatMessage::assistant("old assistant")),
@@ -9255,7 +10207,7 @@ mod tests {
         );
     }
 
-    fn trim_history_test_agent(max_history_messages: usize, observer: Arc<dyn Observer>) -> Agent {
+    fn trim_history_test_agent(max_history_turns: usize, observer: Arc<dyn Observer>) -> Agent {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
             ..zeroclaw_config::schema::MemoryConfig::default()
@@ -9281,7 +10233,7 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .config(agent_config)
-            .structured_max_history_messages(max_history_messages)
+            .structured_max_history_turns(max_history_turns)
             .build()
             .expect("agent builder should succeed with valid config")
     }
@@ -9337,7 +10289,7 @@ mod tests {
     }
 
     #[test]
-    fn trim_history_preserves_single_tool_heavy_turn_over_message_cap() {
+    fn trim_history_does_not_count_tool_rows_as_turns() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
         let mut agent = trim_history_test_agent(50, observer);
         agent
@@ -9355,7 +10307,7 @@ mod tests {
         assert_eq!(
             agent.history.len(),
             64,
-            "the newest complete turn must survive even when it exceeds the message cap"
+            "tool rows within one turn must not consume the turn limit"
         );
         assert!(matches!(
             agent.history.first(),
@@ -9388,7 +10340,7 @@ mod tests {
     fn trim_history_drops_old_turn_with_breadcrumb_and_observer_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
             ConversationMessage::Chat(ChatMessage::user("old user")),
@@ -9490,7 +10442,7 @@ mod tests {
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .model_name("test-model".into())
             .config(config)
-            .structured_max_history_messages(2)
+            .structured_max_history_turns(1)
             .build()
             .expect("agent builder should succeed with valid config");
         agent.history = vec![
@@ -9543,7 +10495,7 @@ mod tests {
     async fn trim_history_runs_after_direct_vision_resolution_error() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         seed_old_trim_test_turn(&mut agent);
 
         let error = agent
@@ -9571,7 +10523,7 @@ mod tests {
     async fn trim_history_runs_after_streamed_vision_resolution_error() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         seed_old_trim_test_turn(&mut agent);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
 
@@ -9595,7 +10547,7 @@ mod tests {
     #[tokio::test]
     async fn trim_history_runs_after_direct_system_prompt_rebuild_error() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         seed_old_trim_test_turn(&mut agent);
         agent.prompt_builder =
             SystemPromptBuilder::default().add_section(Box::new(FailingPromptSection));
@@ -9616,7 +10568,7 @@ mod tests {
     #[tokio::test]
     async fn trim_history_runs_after_streamed_system_prompt_rebuild_error() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         seed_old_trim_test_turn(&mut agent);
         agent.prompt_builder =
             SystemPromptBuilder::default().add_section(Box::new(FailingPromptSection));
@@ -9639,7 +10591,7 @@ mod tests {
     #[tokio::test]
     async fn trim_history_runs_before_streamed_round_loop_exhaustion_error() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.config.resolved.max_tool_iterations = 0;
         seed_old_trim_test_turn(&mut agent);
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
@@ -9667,7 +10619,7 @@ mod tests {
         while log_rx.try_recv().is_ok() {}
 
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.agent_alias = "trim-test-agent".into();
         agent.channel_name = "trim-test-channel".into();
         agent.history = vec![
@@ -9715,6 +10667,14 @@ mod tests {
         );
         assert_eq!(event.zeroclaw.get("channel"), None);
         assert_eq!(event.trace_id.as_deref(), Some("trim-test-turn"));
+        assert_eq!(
+            event
+                .attributes
+                .get("max_history_turns")
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "the configured whole-turn cap should be logged"
+        );
         assert!(event.attributes.get("agent_alias").is_none());
         assert!(event.attributes.get("channel").is_none());
         assert!(event.attributes.get("turn_id").is_none());
@@ -9726,7 +10686,7 @@ mod tests {
     async fn trim_history_streamed_turn_forwards_single_hard_cap_event() {
         let capturing = Arc::new(CapturingObserver::default());
         let observer: Arc<dyn Observer> = capturing.clone();
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
             ConversationMessage::Chat(ChatMessage::user("old user")),
@@ -9743,18 +10703,21 @@ mod tests {
         while let Ok(event) = event_rx.try_recv() {
             if let TurnEvent::HistoryTrimmed {
                 dropped_messages,
+                dropped_turns,
                 kept_turns,
                 reason,
+                ..
             } = event
             {
-                trim_events.push((dropped_messages, kept_turns, reason));
+                trim_events.push((dropped_messages, dropped_turns, kept_turns, reason));
             }
         }
         assert_eq!(trim_events.len(), 1, "one streamed trim event is required");
         assert_eq!(trim_events[0].0, 2);
         assert_eq!(trim_events[0].1, 1);
+        assert_eq!(trim_events[0].2, 1);
         assert_eq!(
-            trim_events[0].2,
+            trim_events[0].3,
             crate::i18n::get_required_cli_string("history-trim-reason-message-cap")
         );
         assert!(capturing.events.lock().iter().any(|event| matches!(
@@ -9769,7 +10732,7 @@ mod tests {
     #[tokio::test]
     async fn trim_history_cancel_before_output_retains_synthesized_newest_turn() {
         let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut agent = trim_history_test_agent(2, observer);
+        let mut agent = trim_history_test_agent(1, observer);
         agent.history = vec![
             ConversationMessage::Chat(ChatMessage::system("system")),
             ConversationMessage::Chat(ChatMessage::user("old user")),
@@ -12801,14 +13764,12 @@ mod tests {
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
             .config(agent_config)
-            .structured_max_history_messages(4)
+            .structured_max_history_turns(2)
             .build()
             .expect("agent builder should succeed with valid config");
 
-        // Pre-fill the history to exactly max_history_messages non-system
-        // messages so that adding a new user+assistant pair triggers trim.
-        // (system message is added by turn_streamed on first call, so we
-        // push user+assistant pairs to simulate a history-at-limit state.)
+        // Pre-fill history to exactly two complete turns so adding a third
+        // turn triggers the configured whole-turn limit.
         agent
             .history
             .push(ConversationMessage::Chat(ChatMessage::system("sys")));
@@ -12824,9 +13785,7 @@ mod tests {
                     "old reply {i}"
                 ))));
         }
-        // History is now: [system, user0, assistant0, user1, assistant1] = 5
-        // entries. The structured message limit of 4 means trim fires after
-        // adding the new turn.
+        // History is now at the two-turn limit; trim fires after the new turn.
 
         let (event_tx, _rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
         let (_, new_msgs) = agent
@@ -14778,7 +15737,7 @@ model_provider = "custom.only"
         );
         assert_eq!(
             retained
-                .structured_history_cap_resolver
+                .structured_history_turn_limit_resolver
                 .as_ref()
                 .expect("direct Agent history resolver")(),
             3,
@@ -15018,6 +15977,126 @@ model_provider = "custom.only"
         assert_eq!(
             agent.model_name, "gpt-4o-mini",
             "model_name must NOT change when provider rebuild is not possible"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_apply_model_switch_uses_target_alias_endpoint_and_credentials() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+        use serde_json::json;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, HailoOllamaModelProviderConfig, ModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        #[derive(Clone)]
+        struct Capture {
+            requests: Arc<AtomicUsize>,
+            authorization: Arc<Mutex<Option<String>>>,
+        }
+
+        async fn chat_handler(
+            State(capture): State<Capture>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            capture.requests.fetch_add(1, Ordering::SeqCst);
+            *capture.authorization.lock() = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            Json(json!({
+                "message": {"role": "assistant", "content": "target"},
+                "done": true,
+            }))
+        }
+
+        async fn start_server(capture: Capture) -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake provider server");
+            let address = listener.local_addr().expect("server address");
+            zeroclaw_spawn::spawn!(async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route("/api/chat", post(chat_handler))
+                        .with_state(capture),
+                )
+                .await
+                .expect("serve fake provider server");
+            });
+            address
+        }
+
+        let current_capture = Capture {
+            requests: Arc::new(AtomicUsize::new(0)),
+            authorization: Arc::new(Mutex::new(None)),
+        };
+        let target_capture = Capture {
+            requests: Arc::new(AtomicUsize::new(0)),
+            authorization: Arc::new(Mutex::new(None)),
+        };
+        let current_address = start_server(current_capture.clone()).await;
+        let target_address = start_server(target_capture.clone()).await;
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("current-secret".to_string()),
+                    uri: Some(format!("http://{current_address}")),
+                    model: Some("current-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.hailo_ollama.insert(
+            "edge".to_string(),
+            HailoOllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    api_key: Some("target-secret".to_string()),
+                    uri: Some(format!("http://{target_address}")),
+                    model: Some("edge-model".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "switcher".to_string(),
+            AliasedAgentConfig {
+                model_provider: zeroclaw_config::providers::ModelProviderRef(
+                    "openai.primary".to_string(),
+                ),
+                ..Default::default()
+            },
+        );
+
+        let switch_config = ProviderSwitchConfig {
+            config: Some(Arc::new(config)),
+            live: None,
+        };
+        let mut agent = build_test_agent("openai.primary", "current-model", Some(switch_config));
+        agent.agent_alias = "switcher".to_string();
+
+        let switched = agent.try_apply_model_switch(
+            "current-model",
+            "hailo_ollama.edge".to_string(),
+            "edge-model".to_string(),
+        );
+        assert_eq!(switched.as_deref(), Some("edge-model"));
+        let response = agent
+            .model_provider
+            .chat_with_system(None, "hello", "edge-model", None)
+            .await
+            .expect("switched target provider should answer");
+        assert_eq!(response, "target");
+        assert_eq!(current_capture.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(target_capture.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            target_capture.authorization.lock().as_deref(),
+            Some("Bearer target-secret")
         );
     }
 

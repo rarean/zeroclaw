@@ -492,6 +492,14 @@ pub struct Config {
     #[nested]
     pub risk_profiles: HashMap<String, RiskProfileConfig>,
 
+    /// Named typed-decision models (`[decision_models.<alias>]`): TypeSafe Jev,
+    /// a self-hosted Laya, or any custom System One endpoint. An SOP selects
+    /// one by alias in its `[decision] model` field; an alias that is not
+    /// configured makes that SOP dispatch fail-closed.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub decision_models: HashMap<String, SopDecisionModelConfig>,
+
     /// OIDC trust relationships (`[oidc.<alias>]`). Each entry names one
     /// issuer whose identities this daemon accepts and how their verified
     /// claims map to permission profiles. Any standards-compliant IdP
@@ -509,7 +517,7 @@ pub struct Config {
 
     /// Named permission profiles (`[permission_profiles.<alias>]`): the
     /// single runtime authorization vocabulary. OIDC claim mappings and
-    /// user roster entries resolve here; deny-by-default — anything a
+    /// user roster entries resolve here; deny-by-default: anything a
     /// profile does not grant is refused.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -831,6 +839,31 @@ pub enum AuthMode {
     OAuth,
 }
 
+/// Prompt-cache entry lifetime to request for this provider's Anthropic
+/// cache markers. `"5m"` is the API default; `"1h"` extends the cache
+/// entry lifetime to one hour so a pause longer than five minutes does
+/// not force a full-price rewrite of the cached prefix. Meaningful only
+/// where Anthropic-shaped `cache_control` markers reach the API: the
+/// native Anthropic provider always places them, compatible providers
+/// only behind `cache_passthrough` (with passthrough off the setting is
+/// inert). One TTL applies to every marker this implementation places;
+/// operator-supplied `cache_control` (via `provider_extra` or raw tool
+/// JSON) sits outside that guarantee and must order 1h before 5m when
+/// mixing lifetimes in one request.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub enum CacheTtl {
+    /// Standard 5-minute cache lifetime (the API default).
+    #[default]
+    #[serde(rename = "5m")]
+    FiveMinutes,
+    /// 1-hour cache lifetime; cache writes bill at a premium write rate.
+    #[serde(rename = "1h")]
+    OneHour,
+}
+
 /// Named model_provider profile definition.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -960,6 +993,36 @@ pub struct ModelProviderConfig {
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
     pub cache_passthrough: bool,
+    /// Cache entry lifetime requested for this provider's Anthropic
+    /// prompt-cache markers. `"5m"` (default) keeps the standard
+    /// 5-minute lifetime; `"1h"` requests a 1-hour lifetime so a pause
+    /// longer than five minutes does not force a full-price rewrite of
+    /// the cached prefix. The 1h lifetime bills cache writes at a
+    /// premium write rate (nominal planning figure: twice the input
+    /// price), so it pays off only when turns regularly resume more
+    /// than five minutes after the last request.
+    ///
+    /// The native Anthropic provider applies this to every cache marker
+    /// it places in a request. Compatible providers apply it only when
+    /// `cache_passthrough` is enabled; without passthrough no markers
+    /// are placed at all and this field is inert (no parse-time warning:
+    /// an operator may stage the key before switching passthrough on).
+    /// Providers that emit their own cache markers by other means
+    /// (openrouter) ignore this setting.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl: Option<CacheTtl>,
+    /// Forward the runtime-configured `reasoning_effort` to every model on
+    /// this OpenAI-compatible provider, not only OpenAI reasoning-family
+    /// names (o1*/o3*/o4*/gpt-5*/gpt-*codex*). The name filter exists because
+    /// some strict backends reject unknown request params with HTTP 400;
+    /// enable this only on a backend verified to accept `reasoning_effort`
+    /// (GLM/Kimi/DeepSeek/Qwen-style reasoners behind OpenAI-compatible
+    /// gateways commonly do). Default `false`: the name filter keeps
+    /// deciding, and non-OpenAI model names never receive the param.
+    #[tab(Advanced)]
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reasoning_effort_passthrough: bool,
     /// Pull live token prices for this provider's models from its own
     /// OpenAI-compatible `/models` listing (the gateway is the source of truth
     /// for its prices), filling cost-tracking rates for models the operator
@@ -2917,7 +2980,9 @@ pub struct GrokCliModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
-    /// Path to the `grok` CLI binary. Falls back to `grok` (PATH lookup).
+    /// Absolute path or bare executable name for the `grok` CLI (default: `grok`).
+    /// Bare names resolve only from absolute PATH directories; empty and relative
+    /// PATH entries are ignored before the subprocess working directory is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary_path: Option<String>,
     /// Required absolute working directory for the `grok` subprocess and ACP
@@ -3689,6 +3754,8 @@ impl Default for DelegateToolConfig {
 pub struct ResolvedRuntime {
     pub compact_context: bool,
     pub max_tool_iterations: usize,
+    /// History retention limit. Structured Agent and legacy loop sessions
+    /// interpret this as complete turns; channel caches retain message rows.
     pub max_history_messages: usize,
     /// Optional operator context budget from `runtime_profiles.<name>.max_context_tokens`.
     /// Without an opt-in ratio, `None` preserves the legacy 32,000-token budget.
@@ -4477,24 +4544,12 @@ impl Config {
 
     /// Resolve the whole-turn history cap used by structured `Agent` sessions.
     ///
-    /// An explicit runtime-profile cap remains authoritative. When omitted, the
-    /// cap scales with the profile's tool-iteration limit while preserving the
-    /// legacy floor of 50 messages.
+    /// The legacy config key is named `max_history_messages`, but structured
+    /// Agent sessions enforce it at complete user-turn boundaries. Tool-call
+    /// and tool-result rows therefore do not consume independent slots there.
     #[must_use]
     pub fn effective_structured_max_history_messages(&self, agent_alias: &str) -> usize {
-        if let Some(max_history_messages) = self
-            .runtime_profile_for_agent(agent_alias)
-            .and_then(|p| p.max_history_messages)
-        {
-            return max_history_messages;
-        }
-
-        // Each tool iteration adds two structural messages; user/final assistant
-        // add two more, while the floor preserves the structured default cap of 50.
-        self.effective_max_tool_iterations(agent_alias)
-            .saturating_mul(2)
-            .saturating_add(2)
-            .max(50)
+        self.effective_max_history_messages(agent_alias)
     }
 
     #[must_use]
@@ -8351,20 +8406,33 @@ impl Default for BrowserComputerUseConfig {
 
 /// Browser automation configuration (`[browser]` section).
 ///
-/// Controls the `browser_open` tool and browser automation backends.
+/// Gates two distinct tools on two independent flags: `enabled` (default
+/// `true`) registers `browser_open`, and `automation_enabled` (default
+/// `false`) registers the full `browser` automation tool. The remaining
+/// fields configure the automation backends and are shared by both.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "browser"]
 #[integration(
     category = "ToolsAutomation",
     display_name = "Browser",
-    description = "Chrome/Chromium control",
-    status_field = "enabled"
+    description = "Open URLs and control Chrome/Chromium",
+    status_method = "integration_active"
 )]
 pub struct BrowserConfig {
     /// Enable `browser_open` tool (opens URLs in the system browser without scraping)
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Enable the full `browser` automation tool (Chrome/Chromium control:
+    /// navigate, click, type, read page content). Opt-in and independent of
+    /// `enabled`, which gates only `browser_open`.
+    /// Automation acts inside browser sessions that may already be logged in,
+    /// so on an always-on agent a prompt-injected message could drive them;
+    /// leave this off unless the agent needs it. It is also absent from
+    /// [`default_auto_approve`], so `browser` calls hit the approval gate
+    /// unless a risk profile lists it explicitly.
+    #[serde(default)]
+    pub automation_enabled: bool,
     /// Allowed domains for `browser_open` (exact or subdomain match)
     #[serde(default = "default_browser_allowed_domains")]
     pub allowed_domains: Vec<String>,
@@ -8414,10 +8482,25 @@ fn default_browser_webdriver_url() -> String {
     "http://127.0.0.1:9515".into()
 }
 
+impl BrowserConfig {
+    /// Status source for the `#[integration(status_method = ...)]`
+    /// descriptor: the "Browser" integration is Active when the runtime
+    /// registers *either* of the tools this section gates — `browser_open`
+    /// (`enabled`) or the full `browser` automation tool
+    /// (`automation_enabled`). Reading only one flag would misreport half
+    /// the combinations: a default config would claim Chrome/Chromium
+    /// control that is not registered, and an automation-only config would
+    /// report Available while automation is live.
+    pub fn integration_active(&self) -> bool {
+        self.enabled || self.automation_enabled
+    }
+}
+
 impl Default for BrowserConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            automation_enabled: false,
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
@@ -8951,10 +9034,10 @@ pub struct BackupConfig {
     /// Maximum number of backups to keep (oldest are pruned).
     #[serde(default = "default_backup_max_keep")]
     pub max_keep: usize,
-    /// Workspace subdirectories to include in backups.
+    /// Subdirectories of the shared data directory to include in backups.
     #[serde(default = "default_backup_include_dirs")]
     pub include_dirs: Vec<String>,
-    /// Output directory for backup archives (relative to workspace root).
+    /// Output directory for backup archives (relative to the shared data directory).
     #[serde(default = "default_backup_destination_dir")]
     pub destination_dir: String,
     /// Optional cron expression for scheduled automatic backups.
@@ -9005,21 +9088,23 @@ impl Default for BackupConfig {
 
 // ── Data Retention ──────────────────────────────────────────────
 
-/// Data retention and purge configuration (`[data_retention]` section).
+/// Retention preview and storage-statistics configuration for the shared data directory
+/// (`[data_retention]` section). Confirmed purge is currently unavailable.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "data_retention"]
 pub struct DataRetentionConfig {
-    /// Enable the `data_management` tool.
+    /// Enable the read-only `data_management` retention-preview tool.
     #[serde(default)]
     pub enabled: bool,
-    /// Days of data to retain before purge eligibility.
+    /// Days of data to retain before preview eligibility.
     #[serde(default = "default_retention_days")]
     pub retention_days: u64,
-    /// Preview what would be deleted without actually removing anything.
+    /// Reserved compatibility field. Confirmed purge is currently unavailable,
+    /// and tool calls default to preview mode.
     #[serde(default)]
     pub dry_run: bool,
-    /// Limit retention enforcement to specific data categories (empty = all).
+    /// Reserved compatibility field. Category filtering is not currently applied.
     #[serde(default)]
     pub categories: Vec<String>,
 }
@@ -9363,6 +9448,47 @@ pub struct PluginEntryConfig {
     /// field, `*` is not accepted here.
     #[serde(default)]
     pub egress_allow_private: Vec<String>,
+    /// Named TLS trust and optional client-certificate profiles a transport
+    /// may select for a destination. A profile chooses certificates only: its
+    /// `hosts` must each be granted by `egress_hosts`, and selecting it never
+    /// reaches a destination the grant does not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[nested]
+    #[natural_key = "name"]
+    pub tls_profiles: Vec<PluginTlsProfileConfig>,
+}
+
+/// One named plugin TLS profile (`[[plugins.entries.tls_profiles]]`).
+///
+/// Every `*_secret` value names a top-level `x-secret: true` property in the
+/// plugin instance's manifest schema. They are references to certificate and
+/// key material held in the instance's secret config, not the material, so
+/// they stay readable plaintext beside `egress_hosts`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[prefix = "plugins.entries.tls_profiles"]
+pub struct PluginTlsProfileConfig {
+    /// Lowercase profile slug a plugin transport selects.
+    #[serde(default)]
+    pub name: String,
+    /// Destinations this profile may be used for. Each must be granted by the
+    /// entry's `egress_hosts`; same grammar.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// Trust the roots plugin HTTPS already trusts (bundled plus this
+    /// machine's store). Default `true`.
+    #[serde(default = "default_true")]
+    pub system_roots: bool,
+    /// Secret property holding one or more PEM CA certificates to trust.
+    #[serde(default)]
+    pub custom_ca_secret: Option<String>,
+    /// Secret property holding a PEM client certificate chain (mTLS).
+    #[serde(default)]
+    pub client_certificate_secret: Option<String>,
+    /// Secret property holding the matching PEM client private key (mTLS).
+    #[serde(default)]
+    pub client_private_key_secret: Option<String>,
 }
 
 /// Plugin system configuration.
@@ -9438,6 +9564,17 @@ impl PluginsConfig {
             .iter()
             .find(|e| e.name == alias)
             .map(|e| (e.egress_hosts.clone(), e.egress_allow_private.clone()))
+            .unwrap_or_default()
+    }
+
+    /// The TLS profiles on the `[[plugins.entries]]` row named `alias`, read
+    /// at use time like [`Self::entry_egress`]. A missing entry has none.
+    #[must_use]
+    pub fn entry_tls_profiles(&self, alias: &str) -> Vec<PluginTlsProfileConfig> {
+        self.entries
+            .iter()
+            .find(|e| e.name == alias)
+            .map(|e| e.tls_profiles.clone())
             .unwrap_or_default()
     }
 }
@@ -13150,6 +13287,19 @@ pub struct ObservabilityConfig {
     #[serde(default = "default_log_persistence_retention_max_age_days")]
     pub log_persistence_retention_max_age_days: u64,
 
+    /// Maximum number of log entries (non-empty JSONL lines) per segment file
+    /// when `log_persistence = "rotating"`. When the active file's line count
+    /// reaches this cap, it is rotated to an archive (an O(1) rename — no
+    /// content is rewritten), the same mechanism as
+    /// `log_persistence_max_bytes`, so each archive produced by this trigger
+    /// holds exactly this many entries in steady state; an existing active
+    /// file that already exceeds the cap when this feature is first enabled
+    /// is archived whole on the next append. `0` disables entry-count rotation.
+    /// Ignored unless `log_persistence = "rotating"`; the `rolling` policy
+    /// keeps its own in-place trim governed by `log_persistence_max_entries`.
+    #[serde(default = "default_log_persistence_max_entries_per_segment")]
+    pub log_persistence_max_entries_per_segment: usize,
+
     /// Tool I/O capture policy: "off" | "redacted" | "full".
     /// - `off`: only tool name + outcome + duration land in the log.
     /// - `redacted` (default): tool input + output are leak-scanned and
@@ -13237,6 +13387,8 @@ impl Default for ObservabilityConfig {
             log_persistence_retention_max_files: default_log_persistence_retention_max_files(),
             log_persistence_retention_max_age_days: default_log_persistence_retention_max_age_days(
             ),
+            log_persistence_max_entries_per_segment:
+                default_log_persistence_max_entries_per_segment(),
             log_tool_io: default_log_tool_io(),
             log_tool_io_truncate_bytes: default_log_tool_io_truncate_bytes(),
             log_tool_io_denylist: Vec::new(),
@@ -13275,6 +13427,11 @@ fn default_log_persistence_rotate_daily() -> bool {
 /// Keep a week of rotated archives by default.
 fn default_log_persistence_retention_max_files() -> usize {
     7
+}
+
+/// Entry-count rotation off by default; operators opt in with an explicit cap.
+fn default_log_persistence_max_entries_per_segment() -> usize {
+    0
 }
 
 /// Age-based cleanup off by default; count-based retention governs unless set.
@@ -13414,7 +13571,11 @@ pub fn default_auto_approve() -> Vec<String> {
         "image_info".into(),
         "weather".into(),
         "tool_search".into(),
-        "browser".into(),
+        // `browser_open` only hands a URL to the system browser — no
+        // scraping, no page interaction — so it stays auto-approved. The
+        // full `browser` automation tool is deliberately absent: it drives a
+        // possibly logged-in Chrome/Chromium session, which is not a
+        // decision to make on the operator's behalf.
         "browser_open".into(),
     ]
 }
@@ -13526,26 +13687,41 @@ fn is_valid_auth_section_name(name: &str) -> bool {
     name.len() <= 64 && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
-/// One OIDC trust relationship (`[oidc.<alias>]`) — the identity-mapping
-/// half consumed by the shared principal resolver.
+/// One OIDC trust relationship (`[oidc.<alias>]`): the identity-mapping
+/// half consumed by the shared principal resolver, plus the
+/// token-verification settings the `oidc.<alias>` auth provider enforces.
 ///
 /// The alias is an operator-chosen handle (it appears in logs and audit
 /// attribution as `oidc.<alias>` and selects the provider during the
 /// handshake), never part of principal identity: canonical identity is
 /// keyed by the validated issuer plus token subject, so renaming an alias
 /// cannot re-key principals or link accounts across issuers.
-///
-/// Token-verification settings (validation mode, audience, client secrets,
-/// lifetimes) ship with the OIDC provider slice; this entry carries what
-/// the resolver needs to map verified claims to permission profiles.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "oidc"]
 #[serde(default)]
 pub struct OidcConfig {
     /// Issuer URL exactly as it appears in validated token `iss` claims
-    /// (e.g. `https://sso.example.com/realms/main`).
+    /// (e.g. `https://sso.example.com/realms/main`). Discovery is fetched
+    /// from `<issuer>/.well-known/openid-configuration` and its `issuer`
+    /// field must match this value exactly.
     pub issuer: String,
+    /// Audience the token must carry in its `aud` claim for this daemon
+    /// (typically the client ID or resource identifier registered at the
+    /// IdP). Required for token verification.
+    pub audience: String,
+    /// Client ID this daemon authenticates AS for confidential flows
+    /// (token introspection; enrollment in a later slice). Defaults to
+    /// `audience` when empty.
+    pub client_id: String,
+    /// Client secret for confidential-client flows (token introspection).
+    /// Not required for JWKS validation. Encrypted at rest.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub client_secret: Option<String>,
+    /// How presented tokens are validated.
+    pub validation: OidcValidation,
     /// Dotted path to the verified claim holding this deployment's
     /// role/group values (e.g. `realm_access.roles`, `groups`). Must be
     /// set explicitly: the daemon refuses to guess where grants live in a
@@ -13563,6 +13739,287 @@ pub struct OidcConfig {
     /// (fail closed).
     #[serde(default)]
     pub service_profile_map: HashMap<String, String>,
+    /// Require the token to attest MFA through the IdP aggregate `mfa`
+    /// marker or an accepted configured ACR before authentication succeeds.
+    pub require_mfa: bool,
+    /// Acceptable `acr` (authentication context class) values. Empty = no
+    /// requirement; non-empty = the token's `acr` claim must be one of
+    /// these values or authentication fails closed.
+    pub required_acr: Vec<String>,
+    /// Allowed `azp` (authorized party) values, meaning the client the token
+    /// was issued TO. Empty = no restriction; non-empty = the token must carry
+    /// an `azp` claim listed here or authentication fails closed.
+    pub allowed_authorized_parties: Vec<String>,
+    /// Client identities whose tokens are ALWAYS service principals
+    /// (`client_credentials` callers), matched against the token's
+    /// verified `client_id` claim. Service principals are keyed by
+    /// issuer + client identity and never inherit human-user assumptions,
+    /// whatever provider-specific shape their `sub` takes (`<client>@clients`,
+    /// a service-account user id, or the client id itself).
+    ///
+    /// Actor classification is declarative, never inferred from the
+    /// `sub`/`client_id` relationship: a token is a service because its
+    /// client is listed here, a human because its client is listed in
+    /// `interactive_clients`, or classified by `actor_claim`. A token whose
+    /// client is declared nowhere and carries no configured actor claim
+    /// evidence is denied. A client may appear in only one of the two lists.
+    pub service_clients: Vec<String>,
+    /// Client identities whose tokens are ALWAYS human principals
+    /// (authorization-code / device-code clients), matched against the
+    /// verified `client_id` claim. Their tokens must carry a nonblank `sub`
+    /// and resolve through `profile_map`. A client may appear in only one of
+    /// `service_clients` and `interactive_clients`.
+    pub interactive_clients: Vec<String>,
+    /// Dotted path to a claim the issuer stamps on exactly ONE actor kind's
+    /// tokens (present, non-null), e.g. Auth0's `gty` on client-credentials
+    /// tokens or Okta's `uid` on user tokens. `actor_claim_marks` names the
+    /// kind its presence proves; absence proves the other kind. Required
+    /// for a client that issues both human and machine tokens (declared in
+    /// neither client list); also checked against declared clients, where
+    /// contradicting evidence denies. Empty = no claim-based classification,
+    /// so every accepted client must be declared.
+    pub actor_claim: String,
+    /// Which actor kind the presence of `actor_claim` proves.
+    pub actor_claim_marks: OidcActorKind,
+    /// Require the RFC 9068 typed JWT profile for JWKS validation. Opaque
+    /// tokens remain valid only through configured introspection.
+    pub require_at_jwt: bool,
+    /// Maximum authentication lifetime (seconds) for offline-validated
+    /// (JWKS) tokens. Offline validation cannot see revocation, so the
+    /// identity expires at the EARLIER of the token `exp` and `iat` + this
+    /// cap. Must be > 0.
+    pub max_auth_lifetime_secs: u64,
+    /// Revalidation interval (seconds) for introspection mode: the
+    /// deadline stamped on each identity after which the next privileged
+    /// operation must re-introspect or fail closed. `0` = revalidate at
+    /// every privileged operation.
+    pub revalidation_secs: u64,
+}
+
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("validation", &self.validation)
+            .field("claim_path", &self.claim_path)
+            .field("profile_map", &self.profile_map)
+            .field("service_profile_map", &self.service_profile_map)
+            .field("require_mfa", &self.require_mfa)
+            .field("required_acr", &self.required_acr)
+            .field(
+                "allowed_authorized_parties",
+                &self.allowed_authorized_parties,
+            )
+            .field("service_clients", &self.service_clients)
+            .field("interactive_clients", &self.interactive_clients)
+            .field("actor_claim", &self.actor_claim)
+            .field("actor_claim_marks", &self.actor_claim_marks)
+            .field("require_at_jwt", &self.require_at_jwt)
+            .field("max_auth_lifetime_secs", &self.max_auth_lifetime_secs)
+            .field("revalidation_secs", &self.revalidation_secs)
+            .finish()
+    }
+}
+
+fn default_oidc_max_auth_lifetime_secs() -> u64 {
+    86_400
+}
+
+fn default_oidc_revalidation_secs() -> u64 {
+    60
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            audience: String::new(),
+            client_id: String::new(),
+            client_secret: None,
+            validation: OidcValidation::default(),
+            claim_path: String::new(),
+            profile_map: HashMap::new(),
+            service_profile_map: HashMap::new(),
+            require_mfa: false,
+            required_acr: Vec::new(),
+            allowed_authorized_parties: Vec::new(),
+            service_clients: Vec::new(),
+            interactive_clients: Vec::new(),
+            actor_claim: String::new(),
+            actor_claim_marks: OidcActorKind::default(),
+            require_at_jwt: true,
+            max_auth_lifetime_secs: default_oidc_max_auth_lifetime_secs(),
+            revalidation_secs: default_oidc_revalidation_secs(),
+        }
+    }
+}
+
+/// Token validation strategy for an OIDC trust relationship.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OidcValidation {
+    /// Validate token signatures offline against the issuer's published
+    /// JWKS (fetched via discovery, refreshed on key rotation with a
+    /// bounded cooldown). No per-request IdP round-trip; revocation is
+    /// bounded by `max_auth_lifetime_secs` and token expiry.
+    #[default]
+    Jwks,
+    /// Validate every token online via the issuer's RFC 7662 introspection
+    /// endpoint. Live revocation within `revalidation_secs`; requires
+    /// `client_secret`.
+    ///
+    /// Endpoint contract (the daemon fails closed on anything less): an
+    /// `active: true` response authenticates only when it also reports
+    /// `token_type: Bearer`, an `aud` containing `audience`, and a nonblank
+    /// `client_id`. The endpoint MUST NOT report refresh tokens, ID tokens,
+    /// or any other non-access credential as an active `Bearer` token for
+    /// this audience: RFC 7662 lets an endpoint introspect refresh tokens
+    /// and treats the daemon's `token_type_hint=access_token` as advisory,
+    /// so this is the issuer's obligation. Where the issuer stamps an
+    /// explicit purpose marker (`typ`, e.g. Keycloak's `Refresh`/`ID`, or
+    /// `token_use`, e.g. Cognito's `id`), any value other than an access
+    /// token is denied.
+    Introspection,
+}
+
+/// The actor kind an OIDC `actor_claim`'s presence proves.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum OidcActorKind {
+    /// The claim is present only on `client_credentials` (machine) tokens;
+    /// a token without it is a human's.
+    #[default]
+    Service,
+    /// The claim is present only on interactive (human) tokens; a token
+    /// without it is a machine's.
+    Human,
+}
+
+impl Config {
+    /// Validate the inbound-authentication sections (`[oidc.<alias>]`,
+    /// `[users]`, `[permission_profiles]`) on their own.
+    ///
+    /// This is the ONE auth-specific validation boundary (RFC 7141). Full
+    /// [`Config::validate`] calls it, but so does authorization-policy
+    /// compilation: `load_or_init` deliberately tolerates a semantically
+    /// invalid config so an operator can boot to repair it, which means the
+    /// resolver cannot assume its input was validated. Running exactly these
+    /// checks again at compile/replace time guarantees that duplicate uids or
+    /// effective principal ids, invalid issuers, and dangling profile
+    /// references can never be installed as a serving policy — without making
+    /// auth activation contingent on every unrelated config field being valid.
+    /// Keys are sorted so the first error reported is deterministic.
+    pub fn validate_auth(&self) -> Result<()> {
+        let mut oidc_aliases: Vec<&String> = self.oidc.keys().collect();
+        oidc_aliases.sort();
+        for alias in oidc_aliases {
+            let oidc = &self.oidc[alias];
+            oidc.validate(alias)?;
+            let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
+            claim_values.sort();
+            for claim_value in claim_values {
+                let profile = &oidc.profile_map[claim_value];
+                if !self.permission_profiles.contains_key(profile) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("oidc.{alias}.profile_map"),
+                        "oidc.{alias}.profile_map[{claim_value:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
+                    );
+                }
+            }
+            // Service mappings reference profiles too: a dangling target
+            // must fail here at load time, not surface later as a
+            // Misconfigured denial when the service first resolves.
+            let mut client_ids: Vec<&String> = oidc.service_profile_map.keys().collect();
+            client_ids.sort();
+            for client_id in client_ids {
+                let profile = &oidc.service_profile_map[client_id];
+                if !self.permission_profiles.contains_key(profile) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("oidc.{alias}.service_profile_map"),
+                        "oidc.{alias}.service_profile_map[{client_id:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
+                    );
+                }
+            }
+        }
+
+        let mut user_names: Vec<&String> = self.users.keys().collect();
+        user_names.sort();
+        let mut uid_owners: HashMap<u32, &str> = HashMap::new();
+        let mut principal_owners: HashMap<&str, &str> = HashMap::new();
+        for name in user_names {
+            let user = &self.users[name];
+            user.validate(name)?;
+            for profile in &user.permission_profiles {
+                let trimmed = profile.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !self.permission_profiles.contains_key(trimmed) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("users.{name}.permission_profiles"),
+                        "users.{name}.permission_profiles names {trimmed:?} but [permission_profiles.{trimmed}] is not configured",
+                    );
+                }
+            }
+            // A uid maps a kernel-reported peer to exactly one
+            // principal; two entries claiming one uid would make
+            // authentication ambiguous.
+            if let Some(uid) = user.uid
+                && let Some(other) = uid_owners.insert(uid, name.as_str())
+            {
+                validation_bail!(
+                    ValidationFailed,
+                    format!("users.{name}.uid"),
+                    "users.{name}.uid = {uid} is already mapped by users.{other}; a uid must resolve to exactly one principal",
+                );
+            }
+            // Two entries resolving to one durable principal id would
+            // silently link accounts and merge their owned data.
+            let principal_id = user.effective_principal_id(name);
+            if let Some(other) = principal_owners.insert(principal_id, name.as_str()) {
+                validation_bail!(
+                    ValidationFailed,
+                    format!("users.{name}.principal_id"),
+                    "users.{name} resolves to principal id {principal_id:?} which users.{other} already uses; principal ids must be unique",
+                );
+            }
+        }
+
+        let mut profile_aliases: Vec<&String> = self.permission_profiles.keys().collect();
+        profile_aliases.sort();
+        for alias in profile_aliases {
+            let profile = &self.permission_profiles[alias];
+            for agent in &profile.allowed_agents {
+                let trimmed = agent.trim();
+                if trimmed.is_empty() || trimmed == "*" {
+                    continue;
+                }
+                if !self.agents.contains_key(trimmed) {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("permission_profiles.{alias}.allowed_agents"),
+                        "permission_profiles.{alias}.allowed_agents names {trimmed:?} but [agents.{trimmed}] is not configured (use \"*\" for every agent)",
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl OidcConfig {
@@ -13623,6 +14080,12 @@ impl OidcConfig {
                 ),
             }
         }
+        if self.audience.trim().is_empty() {
+            anyhow::bail!(
+                "oidc.{alias}.audience is required: tokens must be minted for this \
+                 daemon's audience, or any token from the issuer would be accepted"
+            );
+        }
         if self.profile_map.is_empty() && self.service_profile_map.is_empty() {
             anyhow::bail!(
                 "oidc.{alias} requires profile_map or service_profile_map: map at least one \
@@ -13636,7 +14099,57 @@ impl OidcConfig {
                  claim carrying role/group values (e.g. `realm_access.roles` or `groups`)"
             );
         }
+        if self.validation == OidcValidation::Introspection && self.client_secret.is_none() {
+            anyhow::bail!(
+                "oidc.{alias}.client_secret is required when validation is `introspection`"
+            );
+        }
+        if self.max_auth_lifetime_secs == 0 {
+            anyhow::bail!(
+                "oidc.{alias}.max_auth_lifetime_secs must be > 0: offline-validated \
+                 tokens need a bounded authentication lifetime"
+            );
+        }
+        if self.validation == OidcValidation::Jwks && !self.require_at_jwt {
+            anyhow::bail!(
+                "oidc.{alias}.require_at_jwt must be true: bearer authentication accepts only \
+                 RFC 9068 typed access tokens"
+            );
+        }
+        for (field, clients) in [
+            ("service_clients", &self.service_clients),
+            ("interactive_clients", &self.interactive_clients),
+        ] {
+            if clients.iter().any(|client| client.trim().is_empty()) {
+                anyhow::bail!("oidc.{alias}.{field} must not contain a blank client id");
+            }
+        }
+        if let Some(shared) = self
+            .service_clients
+            .iter()
+            .find(|client| self.interactive_clients.contains(client))
+        {
+            anyhow::bail!(
+                "oidc.{alias}: client {shared:?} is declared in both service_clients and \
+                 interactive_clients; a client that issues both kinds of token must be listed \
+                 in neither and classified by actor_claim"
+            );
+        }
+        if self.actor_claim != self.actor_claim.trim() {
+            anyhow::bail!("oidc.{alias}.actor_claim must not have surrounding whitespace");
+        }
         Ok(())
+    }
+
+    /// The client ID used for confidential-client calls (introspection);
+    /// falls back to `audience` when unset.
+    #[must_use]
+    pub fn effective_client_id(&self) -> &str {
+        if self.client_id.trim().is_empty() {
+            &self.audience
+        } else {
+            &self.client_id
+        }
     }
 }
 
@@ -13649,11 +14162,12 @@ impl OidcConfig {
 #[serde(default)]
 pub struct UserConfig {
     /// Durable principal identifier for this entry; defaults to the entry
-    /// name. Ownership of sessions, memory, approvals, and audit trails
-    /// keys on this id, NOT on the entry name — so to rename the entry
-    /// without orphaning its data, set `principal_id` to the original id
-    /// in the same edit. Changing an entry's effective principal id
-    /// creates a new principal that owns nothing.
+    /// name. Audit records key on this id, NOT on the entry name, and
+    /// ownership of sessions, memory, and approvals will key on it once
+    /// principal-owned storage lands. To rename the entry without
+    /// orphaning its data, set `principal_id` to the original id in the
+    /// same edit. Changing an entry's effective principal id creates a
+    /// new principal.
     pub principal_id: Option<String>,
     /// Unix uid accepted for this user over the local socket (peer
     /// credential). Required today: it is the only roster credential the
@@ -13728,10 +14242,13 @@ pub struct PermissionProfileConfig {
     /// exact prop; `"*"` grants every path. Empty grants NO paths.
     pub config_write_paths: Vec<String>,
     /// Tool names holders may cause an agent to run. Empty grants NO
-    /// tools — broad access requires the explicit `"*"` entry. (Note this
-    /// differs from risk-profile `allowed_tools`, where empty means
-    /// unconstrained: permission profiles are deny-by-default. The
-    /// agent's own risk-profile policy still applies on top.)
+    /// tools; broad access requires the explicit `"*"` entry. This selector
+    /// composes with the coarse `tools = ["execute"]` grant, never replaces
+    /// it: without that grant the holder's sessions run tool-less whatever
+    /// is named here. (Note this differs from risk-profile `allowed_tools`,
+    /// where empty means unconstrained: permission profiles are
+    /// deny-by-default. The agent's own risk-profile policy still applies
+    /// on top.)
     pub allowed_tools: Vec<String>,
     /// Resource-class grants: for each resource kind, the verbs
     /// permitted. Resources: `system`, `sessions`, `memory`, `cron`,
@@ -14120,7 +14637,9 @@ pub struct RuntimeProfileConfig {
     /// Agentic delegate run timeout in seconds. `None` inherits global.
     pub agentic_timeout_secs: Option<u64>,
     // ── Per-agent runtime tunables (also live on AliasedAgentConfig) ─
-    /// Maximum conversation history messages retained per session. `None` inherits.
+    /// History retention limit per session. Structured Agent and legacy loop
+    /// sessions count complete turns; channel caches count message rows. `None`
+    /// inherits the default of 50.
     pub max_history_messages: Option<usize>,
     /// Maximum estimated tokens before proactive history trimming. `None`
     /// preserves the legacy 32,000-token default when `context_compact_ratio`
@@ -14315,7 +14834,10 @@ pub struct RuntimeConfig {
     /// Shell binary the native runtime uses for command execution.
     ///
     /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
-    /// When unset or `null`, the system default `sh` is used.
+    /// When unset or `null`, the platform default is detected. Windows tries
+    /// `pwsh`, then `powershell`, then `cmd.exe`; macOS prefers the current
+    /// user's passwd login shell, then `zsh`, `bash`, and `/bin/sh`; Linux
+    /// prefers the passwd login shell, then `bash`, `zsh`, and `/bin/sh`.
     ///
     /// **Unix:** POSIX-compatible shells are invoked as
     /// `<shell> -c "<command>"`. Accepted forms:
@@ -14340,7 +14862,7 @@ pub struct RuntimeConfig {
     ///   as a bare name resolved via `PATH` or an absolute path (e.g.
     ///   `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`), run the command as
     ///   `<interpreter> -NoProfile -NonInteractive -Command <command>`;
-    /// - any other value (including the default `sh` and an explicit `"cmd"`)
+    /// - any other value (including an explicit `"cmd"`)
     ///   runs `cmd.exe /C "<command>"`, preserving the historical behaviour.
     ///
     /// Only an empty/whitespace value is rejected on Windows; the interpreter is
@@ -18773,7 +19295,7 @@ impl ChannelConfig for LineConfig {
 /// Sandbox backend and resource limits live on per-agent risk profiles
 /// (see `RiskProfileConfig::sandbox_*` and `RiskProfileConfig::max_*`); the
 /// runtime resolves them via `Config::active_risk_profile(agent_alias)`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security"]
 pub struct SecurityConfig {
@@ -18824,6 +19346,15 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub nat64_prefixes: Vec<String>,
 
+    /// Whether the daemon's OWN uid keeps the trusted shared-operator path
+    /// on the local socket even when a `[users]` roster is configured.
+    /// Default `true`: the operator who runs the daemon (and owns its
+    /// config file) retains local authority, which is also what makes
+    /// local-only lockout recovery possible. Set `false` to require every
+    /// local peer — including the daemon's own uid — to map through
+    /// `[users.<name>].uid` or present a credential.
+    #[serde(default = "default_true")]
+    pub trust_daemon_uid: bool,
     /// Audit logging configuration
     #[serde(default)]
     #[nested]
@@ -18854,6 +19385,21 @@ pub struct SecurityConfig {
     #[serde(default)]
     #[nested]
     pub webauthn: WebAuthnConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            trust_daemon_uid: default_true(),
+            audit: AuditConfig::default(),
+            leak_detection: LeakDetectionConfig::default(),
+            otp: OtpConfig::default(),
+            estop: EstopConfig::default(),
+            nevis: NevisConfig::default(),
+            webauthn: WebAuthnConfig::default(),
+            nat64_prefixes: Vec::new(),
+        }
+    }
 }
 
 /// Outbound credential leak detection configuration.
@@ -19307,23 +19853,44 @@ pub enum SandboxBackend {
 }
 
 /// Audit logging configuration
+///
+/// **Scope:** the audit trail currently records certificate issuance and
+/// renewal. Command execution is NOT audited: no runtime path calls
+/// `AuditLogger::log_command_event` outside tests, so no tool command, its
+/// arguments, its approval or its rejection is ever written here. Treat this
+/// section as the certificate trail, not as a record of what the agent ran.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security.audit"]
 pub struct AuditConfig {
-    /// Enable audit logging
+    /// Enable audit logging.
+    ///
+    /// Defaults to `true`, which is what keeps the certificate issuance and
+    /// renewal trail being written. Setting it to `false` turns that trail
+    /// off: certificate issuance and renewal then have no audit-log record.
+    /// Enabling it does not start recording command execution, which has no
+    /// production writer.
     #[serde(default = "default_audit_enabled")]
     pub enabled: bool,
 
-    /// Path to audit log file (relative to zeroclaw dir)
+    /// Path to audit log file (relative to zeroclaw dir).
+    ///
+    /// Receives the certificate issuance and renewal events. No command
+    /// execution record is ever written to it.
     #[serde(default = "default_audit_log_path")]
     pub log_path: String,
 
-    /// Maximum log size in MB before rotation
+    /// Maximum log size in MB before rotation.
+    ///
+    /// Applies to the certificate trail written at `log_path`.
     #[serde(default = "default_audit_max_size_mb")]
     pub max_size_mb: u32,
 
-    /// Sign events with HMAC for tamper evidence
+    /// Sign events with HMAC for tamper evidence.
+    ///
+    /// Applies to the certificate trail written at `log_path`. It cannot make
+    /// command execution tamper-evident, because command execution is not
+    /// recorded.
     #[serde(default)]
     pub sign_events: bool,
 }
@@ -20604,6 +21171,7 @@ impl Default for Config {
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            decision_models: HashMap::new(),
             oidc: HashMap::new(),
             users: HashMap::new(),
             permission_profiles: HashMap::new(),
@@ -21065,7 +21633,7 @@ const SAVE_PRESERVE_KEYS: &[&str] = &["schema_version"];
 /// instead of running every section header directly after the
 /// previous line (`toml::to_string_pretty` doesn't gap between a
 /// trailing scalar and the next section header).
-fn ensure_blank_line_before_sections(toml: &str) -> String {
+pub(crate) fn ensure_blank_line_before_sections(toml: &str) -> String {
     let mut out = String::with_capacity(toml.len() + 64);
     let mut prev_line_blank = true; // start of file counts as blank
     for line in toml.lines() {
@@ -21089,7 +21657,7 @@ fn ensure_blank_line_before_sections(toml: &str) -> String {
 /// HashMap-keyed sub-trees (e.g. `agents`, `providers.models.<family>`)
 /// are not in the typed default tree, so their operator-added aliases
 /// pass through this filter unchanged.
-fn prune_default_values(actual: &mut toml::Table, defaults: &toml::Table) {
+pub(crate) fn prune_default_values(actual: &mut toml::Table, defaults: &toml::Table) {
     let keys: Vec<String> = actual.keys().cloned().collect();
     for key in keys {
         if SAVE_PRESERVE_KEYS.contains(&key.as_str()) {
@@ -21206,6 +21774,209 @@ struct ExtraNestedModelProviderTable {
     nested: String,
 }
 
+/// Marks a resolved peer entry as a deny rule rather than a grant.
+///
+/// Defined here because `channel_external_peers` writes the marker; the channel
+/// allowlist re-exports this constant rather than spelling the character again,
+/// so producer and consumer cannot drift. No chat platform admits a username
+/// beginning with `!`, and an entry that did would be denied rather than
+/// granted, so the reservation fails closed.
+pub const PEER_DENY_PREFIX: char = '!';
+
+/// How many `PEER_DENY_PREFIX` characters open `value`.
+fn leading_deny_prefixes(value: &str) -> usize {
+    value
+        .bytes()
+        .take_while(|byte| *byte == PEER_DENY_PREFIX as u8)
+        .count()
+}
+
+/// The grant identity `entry` names, or `None` when `entry` is a deny marker.
+///
+/// Grants and denies share one string channel, so the encoding has to stay
+/// injective even when the identity itself opens with the marker character.
+/// RFC 5322 permits `!` to open an email local-part, and the email and Gmail
+/// matchers take full addresses through this helper, so `!user@example.com` is
+/// an address an operator may legitimately grant *or* ignore. The two cases
+/// must not collide: an encoding that maps a grant of `!x` and a deny of `!x`
+/// onto the same string silently inverts one of them, which on an authorization
+/// surface is the whole failure mode.
+///
+/// So the *count* of leading markers carries the decision, not merely its
+/// presence. An identity opening with `k` markers is emitted with `2k` for a
+/// grant and `2k + 1` for a deny: an even run is a grant, an odd run is a deny,
+/// and halving the run recovers the identity in both cases. An identity that
+/// does not open with the marker keeps the original encoding, so every existing
+/// config and every entry in a persisted `config.toml` reads exactly as before.
+///
+/// | identity | as a grant | as a deny |
+/// | --- | --- | --- |
+/// | `alice` | `alice` | `!alice` |
+/// | `!alice` | `!!alice` | `!!!alice` |
+///
+/// Pairs with `peer_grant_marker` and `peer_deny_marker`.
+#[must_use]
+pub fn peer_grant_identity(entry: &str) -> Option<&str> {
+    let markers = leading_deny_prefixes(entry);
+    // An odd run is a deny; only an even one names a grant.
+    if !markers.is_multiple_of(2) {
+        return None;
+    }
+    // Dropping half the run leaves the identity's own markers in place.
+    // `PEER_DENY_PREFIX` is ASCII, so the byte index is a char boundary.
+    Some(&entry[markers / 2..])
+}
+
+/// The identity `entry` denies, or `None` when `entry` is a grant.
+///
+/// The odd-run half of the contract described on `peer_grant_identity`.
+#[must_use]
+pub fn peer_deny_identity(entry: &str) -> Option<&str> {
+    let markers = leading_deny_prefixes(entry);
+    if markers.is_multiple_of(2) {
+        return None;
+    }
+    Some(&entry[markers.div_ceil(2)..])
+}
+
+/// Encode `identity` as a grant entry: an even run of markers.
+#[must_use]
+pub fn peer_grant_marker(identity: &str) -> String {
+    let markers = leading_deny_prefixes(identity);
+    format!("{}{identity}", PEER_DENY_PREFIX.to_string().repeat(markers))
+}
+
+/// Encode `identity` as a deny marker: an odd run of markers.
+#[must_use]
+pub fn peer_deny_marker(identity: &str) -> String {
+    let markers = leading_deny_prefixes(identity);
+    format!(
+        "{}{identity}",
+        PEER_DENY_PREFIX.to_string().repeat(markers + 1)
+    )
+}
+
+/// The `peer_groups` table as it is on disk right now, or `None` when the file
+/// does not exist yet and the in-memory copy is all there is.
+///
+/// Only the policy table is taken. Reloading the whole `Config` would pull the
+/// secret, env-override and 1Password snapshot state that `save` depends on
+/// through a second decrypt cycle, and a peer-group write has no business
+/// rewriting any of it.
+///
+/// Every writer of a peer group needs this: the daemon gives the gateway, the
+/// RPC path and the channels separate `Config` copies of the same file, so
+/// holding the shared write lock is not sufficient on its own. A handle's
+/// `peer_groups` can be older than what another writer already saved, and the
+/// write would then check policy against stale state and persist it back over
+/// the newer table.
+pub async fn persisted_peer_groups(
+    config_path: &std::path::Path,
+) -> anyhow::Result<Option<std::collections::HashMap<String, crate::multi_agent::PeerGroupConfig>>>
+{
+    if !tokio::fs::try_exists(config_path).await.unwrap_or(false) {
+        return Ok(None);
+    }
+    let raw = tokio::fs::read_to_string(config_path)
+        .await
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    let doc: toml::Table = raw
+        .parse()
+        .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+    let Some(table) = doc.get("peer_groups") else {
+        // The file exists and declares no groups, which is a policy of "none"
+        // and must not be confused with "could not read it".
+        return Ok(Some(std::collections::HashMap::new()));
+    };
+    let groups = table
+        .clone()
+        .try_into()
+        .context("Failed to deserialize [peer_groups] from config.toml")?;
+    Ok(Some(groups))
+}
+
+/// Whether a peer entry is the wildcard.
+#[must_use]
+pub fn peer_is_wildcard(entry: &str) -> bool {
+    entry.trim() == "*"
+}
+
+/// Whether a deny entry names `user`.
+///
+/// A deny rule is checked with the caller's own notion of identity *and* with a
+/// normalized comparison (leading `@` stripped, ASCII case-insensitive). A
+/// blocklist errs toward denying, so matching a superset is the safe direction:
+/// the alternative admits a sender the operator wrote down.
+#[must_use]
+pub fn peer_deny_names(entry: &str, user: &str, match_fn: &impl Fn(&str, &str) -> bool) -> bool {
+    // `ignore = ["*"]` denies every sender, the mirror of a wildcard grant.
+    if peer_is_wildcard(entry) {
+        return true;
+    }
+    let normalize = |value: &str| value.trim().trim_start_matches('@').to_string();
+    match_fn(entry, user) || normalize(entry).eq_ignore_ascii_case(&normalize(user))
+}
+
+/// Whether any deny entry in a resolved peer list names any of `identities`.
+///
+/// Lives here rather than beside the channel allowlist because
+/// `channel_external_peers` produces the encoding, and consumers outside
+/// `zeroclaw-channels` have to decode it the same way. The plugin ingress in
+/// `zeroclaw-runtime` is one: `zeroclaw-channels` depends on `zeroclaw-runtime`,
+/// so it cannot reach back for the helper, and a second implementation of deny
+/// precedence on an authorization surface is the drift this codec exists to
+/// prevent.
+#[must_use]
+pub fn peer_policy_denies(
+    allowed: &[String],
+    identities: &[&str],
+    match_fn: impl Fn(&str, &str) -> bool,
+) -> bool {
+    identities.iter().any(|user| {
+        allowed
+            .iter()
+            .filter_map(|entry| peer_deny_identity(entry))
+            .any(|entry| peer_deny_names(entry, user, &match_fn))
+    })
+}
+
+/// Whether a resolved peer list authorizes an account, across every identifier
+/// it is known by. Denies are applied before any grant, including a wildcard.
+///
+/// Asking per identifier and OR-ing the answers is not equivalent: a deny names
+/// one identifier while the wildcard grants every other, so the deny goes false
+/// on its own identifier and the wildcard goes true on the next one, and the
+/// account is admitted.
+#[must_use]
+pub fn peer_policy_admits(
+    allowed: &[String],
+    identities: &[&str],
+    match_fn: impl Fn(&str, &str) -> bool,
+) -> bool {
+    // An account the channel could not identify is not authorized, wildcard or
+    // not: there is nothing for a deny rule to name. Adapters substitute `""`
+    // for a missing field, so a non-empty slice carrying nothing usable would
+    // otherwise reach the wildcard branch with no identifiable sender at all.
+    if identities.iter().all(|user| user.trim().is_empty()) {
+        return false;
+    }
+    if peer_policy_denies(allowed, identities, &match_fn) {
+        return false;
+    }
+    let grants = || {
+        allowed
+            .iter()
+            .filter_map(|entry| peer_grant_identity(entry))
+            // A blank grant names nobody, so it must not match an identifier
+            // the channel could not fill in.
+            .filter(|entry| !entry.trim().is_empty())
+    };
+    if grants().any(peer_is_wildcard) {
+        return true;
+    }
+    grants().any(|entry| identities.iter().any(|user| match_fn(entry, user)))
+}
+
 /// Classification of a `peer_groups.<name>.channel` reference against the
 /// configured `[channels.*]` blocks. This is the single source of truth for
 /// resolving a raw `channel` string — `Config::validate()` consumes it for
@@ -21241,16 +22012,128 @@ enum PeerGroupChannelRef {
 }
 
 impl Config {
-    /// External-peer usernames authorized on `<channel_type>.<alias>`.
+    /// The resolved peer policy for `<channel_type>.<alias>`: every granted
+    /// entry, plus every `ignore` entry as a `PEER_DENY_PREFIX` marker.
     ///
     /// A `[peer_groups.<name>]` contributes when its `channel` field either
     /// matches `channel_type` (type-wide group, applies to every alias of
     /// that type) or matches the full dotted `"<channel_type>.<alias>"`
     /// (instance-scoped group, applies to that one alias only).
+    ///
+    /// This is an authorization input, not a list of addresses. Pass it to the
+    /// channel's allowlist helpers, which apply denies before grants under that
+    /// channel's identity rules. For a reachable account use
+    /// `channel_addressable_peers`.
     pub fn channel_external_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
+        self.channel_external_peers_for(&[channel_type], alias)
+    }
+
+    /// `channel_external_peers` for a channel written more than one way in
+    /// `peer_groups` (WeCom WebSocket is both `wecom-ws` and `wecom_ws`).
+    ///
+    /// Resolving each spelling separately and concatenating the results loses
+    /// denies: an `ignore` under one spelling and a wildcard grant under the
+    /// other never meet. One pass over every matching group keeps the contract
+    /// whole.
+    ///
+    /// Grants and denies are both returned as the operator wrote them, and
+    /// neither is applied here. Deciding a deny at this layer would need an
+    /// identity comparison, and only the channel knows what identity means:
+    /// Reddit reads `u/alice` and `alice` as one account, WhatsApp reads
+    /// `+1555...` and `1555...` as one number, Nostr rewrites npub to hex.
+    /// Subtracting with a generic rule instead resolved the two sides under
+    /// different semantics, so an `ignore` the channel would have matched
+    /// disappeared before the channel ever saw it. The peer list now carries
+    /// the whole policy to the one place that can apply it consistently.
+    pub fn channel_external_peers_for(&self, channel_types: &[&str], alias: &str) -> Vec<String> {
+        let matching_groups: Vec<_> = self
+            .peer_groups
+            .values()
+            .filter(|group| match group.channel.split_once('.') {
+                Some((ty, al)) => channel_types.contains(&ty) && al == alias,
+                None => channel_types.contains(&group.channel.as_str()),
+            })
+            .collect();
+        // Sorted because `peer_groups` is a `HashMap`: without it the resolved
+        // order varies between runs, which reaches `channel_addressable_peers`
+        // and would pick a different heartbeat target on each restart.
+        let mut out: Vec<String> = matching_groups
+            .iter()
+            .flat_map(|group| &group.external_peers)
+            .map(|peer| peer_grant_marker(peer.as_str()))
+            .collect();
+        out.sort();
+        out.dedup();
+        // Every deny travels as a `!name` marker that the channel allowlist
+        // applies ahead of any grant, including a wildcard. Sorted for a
+        // deterministic result.
+        let mut denied: Vec<String> = matching_groups
+            .iter()
+            .flat_map(|group| &group.ignore)
+            .map(|peer| peer.as_str().to_string())
+            .collect();
+        denied.sort();
+        denied.dedup();
+        out.extend(
+            denied
+                .into_iter()
+                .map(|peer| peer_deny_marker(peer.as_str())),
+        );
+        out
+    }
+
+    /// Peers on `<channel_type>.<alias>` that name one reachable account.
+    ///
+    /// `channel_external_peers` answers "who is authorized", so it carries
+    /// wildcards and deny markers, neither of which is an address. Callers that
+    /// need somewhere to send a message want this instead.
+    pub fn channel_addressable_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
+        let resolved = self.channel_external_peers(channel_type, alias);
+        let denied: std::collections::HashSet<String> = resolved
+            .iter()
+            .filter_map(|peer| peer_deny_identity(peer))
+            .map(|peer| peer.trim().trim_start_matches('@').to_lowercase())
+            .collect();
+        // `ignore = ["*"]` denies every sender, so it leaves nothing
+        // addressable either. Subtracting only the names in the deny set misses
+        // it: a wildcard deny names nobody, so an ordinary grant survives it and
+        // heartbeat auto-detection would pick an account the policy rejects.
+        if denied.iter().any(|peer| peer == "*") {
+            return Vec::new();
+        }
+        resolved
+            .iter()
+            .filter_map(|peer| peer_grant_identity(peer))
+            .filter(|peer| peer.trim() != "*")
+            // A blank grant is not an address. `external_peers = [""]` parses,
+            // and heartbeat auto-detection takes the first entry it is handed,
+            // so leaving it in makes an empty string a proactive recipient.
+            .filter(|peer| !peer.trim().is_empty())
+            .filter(|peer| !denied.contains(&peer.trim().trim_start_matches('@').to_lowercase()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Peer usernames for `<channel_type>.<alias>` from every
+    /// `[peer_groups.<name>]` whose `channel` matches (type-wide or dotted)
+    /// **and** whose `output_modality` is `modality`. Deduped, in group
+    /// iteration order.
+    ///
+    /// This is the live-resolve counterpart of `channel_external_peers`,
+    /// filtered to one output modality. No cache — single source of truth
+    /// is `self.peer_groups`.
+    pub fn channel_modality_peers(
+        &self,
+        channel_type: &str,
+        alias: &str,
+        modality: crate::multi_agent::OutputModality,
+    ) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for group in self.peer_groups.values() {
+            if group.output_modality != modality {
+                continue;
+            }
             let group_matches = match group.channel.split_once('.') {
                 Some((ty, al)) => ty == channel_type && al == alias,
                 None => group.channel == channel_type,
@@ -21265,42 +22148,41 @@ impl Config {
                 }
             }
         }
+        // Modality selection controls reply and proactive delivery, so the same
+        // `ignore` that denies a sender has to remove them here. This walks
+        // `external_peers` directly and otherwise never consults `ignore`.
+        //
+        // Subtract the denies directly rather than filtering through
+        // `channel_addressable_peers`: that view answers a different question
+        // ("which concrete account can we address") and so drops `*` on
+        // purpose, which silently deleted a wildcard voice grant and sent every
+        // sender back to the room-membership fallback.
+        let resolved = self.channel_external_peers(channel_type, alias);
+        let denied: std::collections::HashSet<String> = resolved
+            .iter()
+            .filter_map(|peer| peer_deny_identity(peer))
+            .map(|peer| peer.trim().trim_start_matches('@').to_lowercase())
+            .collect();
+        // `ignore = ["*"]` denies every sender, so no modality applies.
+        if denied.iter().any(|peer| peer == "*") {
+            return Vec::new();
+        }
+        out.retain(|peer| {
+            peer.trim() == "*"
+                || !denied.contains(&peer.trim().trim_start_matches('@').to_lowercase())
+        });
         out
     }
 
     /// Voice-peer usernames for `<channel_type>.<alias>` that should always
-    /// receive TTS voice replies.
-    ///
-    /// A `[peer_groups.<name>]` contributes when its `channel` field matches
-    /// (type-wide or dotted) **and** `output_modality = "voice"`.
-    ///
-    /// This is the live-resolve counterpart of `channel_external_peers`,
-    /// filtered to voice-only peer groups. No cache — single source of truth
-    /// is `self.peer_groups`.
+    /// receive TTS voice replies: the `channel_modality_peers` of
+    /// `output_modality = "voice"`.
     pub fn channel_voice_peers(&self, channel_type: &str, alias: &str) -> Vec<String> {
-        use crate::multi_agent::OutputModality;
-
-        let mut out: Vec<String> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for group in self.peer_groups.values() {
-            if group.output_modality != OutputModality::Voice {
-                continue;
-            }
-            let group_matches = match group.channel.split_once('.') {
-                Some((ty, al)) => ty == channel_type && al == alias,
-                None => group.channel == channel_type,
-            };
-            if !group_matches {
-                continue;
-            }
-            for peer in &group.external_peers {
-                let username = peer.as_str().to_string();
-                if seen.insert(username.clone()) {
-                    out.push(username);
-                }
-            }
-        }
-        out
+        self.channel_modality_peers(
+            channel_type,
+            alias,
+            crate::multi_agent::OutputModality::Voice,
+        )
     }
 
     /// Sender usernames authorized to issue `/model --agent <model>` on
@@ -22055,6 +22937,28 @@ impl Config {
                     format!("providers.models.{family}.{alias}.wire_api"),
                 ));
             }
+        }
+        // `security.audit` is the certificate issuance and renewal trail, and
+        // nothing else: `AuditLogger::log_command_event` has no production
+        // caller, so tool commands are never recorded. Turning the section off
+        // therefore removes the only record it does produce while adding no
+        // command record in exchange, and `AuditLogger::log` returns `Ok(())`
+        // without writing, so nothing else reports the loss. Warn on the
+        // disabling value, and say in the same breath which record the
+        // operator does and does not get, so nobody reads "audit" as a record
+        // of what the agent ran.
+        if !self.security.audit.enabled {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+                "security.audit.enabled=false: certificates are issued and renewed with no \
+                 audit record. Command execution is not audited either way, because no \
+                 production path records tool commands. Leave the section enabled to keep \
+                 the certificate trail, and use an external supervisor or logging wrapper \
+                 that observes the ZeroClaw process, or OS-level process accounting, if you \
+                 need a record of what ran."
+                    .to_string(),
+                "security.audit.enabled",
+            ));
         }
         warnings
     }
@@ -23263,107 +24167,28 @@ impl Config {
             }
         }
 
-        // Inbound authentication & principals (RFC 7141): each auth section
-        // must be internally valid, reference only configured entries, and
-        // map credentials and principal ids unambiguously. Keys are sorted
-        // so the first error reported is deterministic.
+        // Inbound authentication & principals (RFC 7141): one auth-specific
+        // validation boundary, shared with policy compilation so an invalid
+        // auth section can never be compiled into a serving policy even when
+        // the boot path tolerates other config errors.
+        self.validate_auth()?;
+
+        // A remote WSS listener with no possible credential path must fail
+        // validation rather than start: before enforcement that meant
+        // silently accepting unauthenticated clients, after it an
+        // enforced-but-unusable listener. gateway.require_pairing keeps a
+        // recoverable path (pair, then authenticate) even with no tokens
+        // yet.
+        if self.wss.enabled
+            && self.oidc.is_empty()
+            && self.gateway.paired_tokens.is_empty()
+            && !self.gateway.require_pairing
         {
-            let mut oidc_aliases: Vec<&String> = self.oidc.keys().collect();
-            oidc_aliases.sort();
-            for alias in oidc_aliases {
-                let oidc = &self.oidc[alias];
-                oidc.validate(alias)?;
-                let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
-                claim_values.sort();
-                for claim_value in claim_values {
-                    let profile = &oidc.profile_map[claim_value];
-                    if !self.permission_profiles.contains_key(profile) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("oidc.{alias}.profile_map"),
-                            "oidc.{alias}.profile_map[{claim_value:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
-                        );
-                    }
-                }
-                // Service mappings reference profiles too: a dangling target
-                // must fail here at load time, not surface later as a
-                // Misconfigured denial when the service first resolves.
-                let mut client_ids: Vec<&String> = oidc.service_profile_map.keys().collect();
-                client_ids.sort();
-                for client_id in client_ids {
-                    let profile = &oidc.service_profile_map[client_id];
-                    if !self.permission_profiles.contains_key(profile) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("oidc.{alias}.service_profile_map"),
-                            "oidc.{alias}.service_profile_map[{client_id:?}] names permission profile {profile:?} but [permission_profiles.{profile}] is not configured",
-                        );
-                    }
-                }
-            }
-
-            let mut user_names: Vec<&String> = self.users.keys().collect();
-            user_names.sort();
-            let mut uid_owners: HashMap<u32, &str> = HashMap::new();
-            let mut principal_owners: HashMap<&str, &str> = HashMap::new();
-            for name in user_names {
-                let user = &self.users[name];
-                user.validate(name)?;
-                for profile in &user.permission_profiles {
-                    let trimmed = profile.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    if !self.permission_profiles.contains_key(trimmed) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("users.{name}.permission_profiles"),
-                            "users.{name}.permission_profiles names {trimmed:?} but [permission_profiles.{trimmed}] is not configured",
-                        );
-                    }
-                }
-                // A uid maps a kernel-reported peer to exactly one
-                // principal; two entries claiming one uid would make
-                // authentication ambiguous.
-                if let Some(uid) = user.uid
-                    && let Some(other) = uid_owners.insert(uid, name.as_str())
-                {
-                    validation_bail!(
-                        ValidationFailed,
-                        format!("users.{name}.uid"),
-                        "users.{name}.uid = {uid} is already mapped by users.{other}; a uid must resolve to exactly one principal",
-                    );
-                }
-                // Two entries resolving to one durable principal id would
-                // silently link accounts and merge their owned data.
-                let principal_id = user.effective_principal_id(name);
-                if let Some(other) = principal_owners.insert(principal_id, name.as_str()) {
-                    validation_bail!(
-                        ValidationFailed,
-                        format!("users.{name}.principal_id"),
-                        "users.{name} resolves to principal id {principal_id:?} which users.{other} already uses; principal ids must be unique",
-                    );
-                }
-            }
-
-            let mut profile_aliases: Vec<&String> = self.permission_profiles.keys().collect();
-            profile_aliases.sort();
-            for alias in profile_aliases {
-                let profile = &self.permission_profiles[alias];
-                for agent in &profile.allowed_agents {
-                    let trimmed = agent.trim();
-                    if trimmed.is_empty() || trimmed == "*" {
-                        continue;
-                    }
-                    if !self.agents.contains_key(trimmed) {
-                        validation_bail!(
-                            DanglingReference,
-                            format!("permission_profiles.{alias}.allowed_agents"),
-                            "permission_profiles.{alias}.allowed_agents names {trimmed:?} but [agents.{trimmed}] is not configured (use \"*\" for every agent)",
-                        );
-                    }
-                }
-            }
+            validation_bail!(
+                ValidationFailed,
+                "wss.enabled",
+                "wss.enabled requires a remote credential path: configure [oidc.<alias>], enable gateway.require_pairing (then pair a device), or keep an existing paired token",
+            );
         }
 
         // Security OTP / estop
@@ -24676,6 +25501,95 @@ impl Config {
                     );
                 }
             }
+
+            // A TLS profile chooses certificates for a destination; it never
+            // grants one. Its hosts must therefore sit inside the entry's
+            // grant, and every secret it names must be a portable reference.
+            let mut profile_names = std::collections::HashSet::new();
+            for (index, profile) in entry.tls_profiles.iter().enumerate() {
+                let path = format!("plugins.entries.{}.tls_profiles[{index}]", entry.name);
+                if !zeroclaw_api::plugin_egress::is_valid_tls_profile_name(&profile.name) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("{path}.name"),
+                        "{path}.name {:?} must be a 1-64 byte lowercase slug of letters, digits, '-' or '_'",
+                        profile.name
+                    );
+                }
+                if !profile_names.insert(profile.name.as_str()) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("{path}.name"),
+                        "plugins.entries.{}.tls_profiles has more than one profile named {:?}",
+                        entry.name,
+                        profile.name
+                    );
+                }
+                if profile.hosts.is_empty() {
+                    validation_bail!(
+                        RequiredFieldEmpty,
+                        format!("{path}.hosts"),
+                        "{path}.hosts must name at least one destination"
+                    );
+                }
+                let profile_hosts = match zeroclaw_infra::net_guard::normalize_egress_patterns(
+                    &profile.hosts,
+                    &format!("{path}.hosts"),
+                ) {
+                    Ok(patterns) => patterns,
+                    Err(e) => validation_bail!(InvalidFormat, format!("{path}.hosts"), "{}", e),
+                };
+                for host in &profile_hosts {
+                    if !hosts.iter().any(|grant| {
+                        zeroclaw_infra::net_guard::egress_pattern_contains(grant, host)
+                    }) {
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("{path}.hosts"),
+                            "{path}.hosts lists {host:?}, which is not granted by plugins.entries.{}.egress_hosts; a TLS profile selects certificates for a granted destination, it does not grant one",
+                            entry.name
+                        );
+                    }
+                }
+                if !profile.system_roots && profile.custom_ca_secret.is_none() {
+                    validation_bail!(
+                        InvalidFormat,
+                        path.clone(),
+                        "{path} trusts nothing: enable system_roots or set custom_ca_secret"
+                    );
+                }
+                for (field, secret) in [
+                    ("custom_ca_secret", profile.custom_ca_secret.as_deref()),
+                    (
+                        "client_certificate_secret",
+                        profile.client_certificate_secret.as_deref(),
+                    ),
+                    (
+                        "client_private_key_secret",
+                        profile.client_private_key_secret.as_deref(),
+                    ),
+                ] {
+                    if secret.is_some_and(|secret| {
+                        zeroclaw_api::plugin_key::SecretPropertyRef::parse(secret.to_owned())
+                            .is_err()
+                    }) {
+                        validation_bail!(
+                            InvalidFormat,
+                            format!("{path}.{field}"),
+                            "{path}.{field} must name a top-level secret property of the plugin's config schema"
+                        );
+                    }
+                }
+                if profile.client_certificate_secret.is_some()
+                    != profile.client_private_key_secret.is_some()
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        path.clone(),
+                        "{path} must set both client_certificate_secret and client_private_key_secret, or neither"
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -24717,11 +25631,41 @@ impl Config {
     /// Rate rows are created explicitly through `POST /api/config/map-key`
     /// instead.
     pub fn ensure_map_key_for_path(&mut self, path: &str) -> bool {
+        self.ensure_key_for_path(path, false)
+    }
+
+    /// [`Self::ensure_map_key_for_path`], also creating a missing entry in a
+    /// keyed list section (`plugins.entries`, `mcp.servers`, `model_routes`,
+    /// `embedding_routes`), addressed by its natural key.
+    ///
+    /// Only the local `zeroclaw config patch` command uses this. The operator
+    /// running it can already edit the config file directly, so creating a
+    /// row there adds no authority; a plugin with no config row otherwise has
+    /// no command that can create one, and `plugin list` needs a repair it can
+    /// print. The remote property-path APIs (the gateway's HTTP set and
+    /// patch, the RPC set) keep [`Self::ensure_map_key_for_path`], so this
+    /// change does not let them create a list row as a side effect of setting
+    /// a field. It is not a remote boundary for plugin grants: the explicit
+    /// map-key create (`POST /api/config/map-key`, RPC `ConfigMapKeyCreate`)
+    /// could already create a `plugins.entries` row, and property set can
+    /// already write `egress_hosts` on an existing row, both behind the
+    /// gateway's authentication.
+    ///
+    /// The same guarantees apply: an existing entry is left alone, and a new
+    /// entry whose trailing field does not resolve is rolled back.
+    pub fn ensure_map_or_list_key_for_path(&mut self, path: &str) -> bool {
+        self.ensure_key_for_path(path, true)
+    }
+
+    fn ensure_key_for_path(&mut self, path: &str, include_lists: bool) -> bool {
         use crate::traits::MapKeyKind;
         let mut best: Option<&'static str> = None;
         for s in Self::map_key_sections()
             .iter()
-            .filter(|s| s.kind == MapKeyKind::Map)
+            .filter(|s| {
+                s.kind == MapKeyKind::Map
+                    || (include_lists && s.kind == MapKeyKind::List && s.natural_key.is_some())
+            })
             .filter(|s| !s.resource_key)
         {
             let prefix = format!("{}.", s.path);
@@ -26405,6 +27349,80 @@ pub struct SopConfig {
     pub procedural_memory_enabled: bool,
 }
 
+/// Which typed-decision service a `[decision_models.<alias>]` entry uses.
+/// All speak the "System One" API (`POST <base_url>/v1/systemone`); the
+/// provider only sets the defaults for `base_url` and `model`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SopDecisionProvider {
+    /// TypeSafe Jev, hosted. Defaults: `https://api.typesafe.ai`, `jev-latest`. Needs `api_key`.
+    #[default]
+    Jev,
+    /// Laya, self-hosted with `laya-serve`. Defaults: `http://127.0.0.1:8000`, `laya`. No key.
+    Laya,
+    /// Any other System One-compatible endpoint. `base_url` is required.
+    Custom,
+}
+
+impl SopDecisionProvider {
+    /// Default `(base_url, model)` for this provider; `None` for `custom`.
+    pub fn defaults(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Jev => Some(("https://api.typesafe.ai", "jev-latest")),
+            Self::Laya => Some(("http://127.0.0.1:8000", "laya")),
+            Self::Custom => None,
+        }
+    }
+}
+
+/// `[decision_models.<alias>]` - a typed-decision model an SOP can select
+/// by alias in its `[decision] model` field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "sop_decision_model"]
+pub struct SopDecisionModelConfig {
+    /// Service: `jev` (TypeSafe, hosted), `laya` (self-hosted), or `custom`.
+    #[serde(default)]
+    pub provider: SopDecisionProvider,
+    /// Endpoint base URL. Defaults from `provider`; required for `custom`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// Model id sent with each request. Defaults from `provider`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Bearer token for the endpoint. Not needed for a local Laya server.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+impl SopDecisionModelConfig {
+    /// The `(base_url, model)` this entry calls, with provider defaults
+    /// applied. `None` when no base URL is known (`custom` without one).
+    pub fn endpoint(&self) -> Option<(String, String)> {
+        let defaults = self.provider.defaults();
+        let base_url = self
+            .base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .or(defaults.map(|(url, _)| url))?;
+        let model = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .or(defaults.map(|(_, model)| model))
+            .unwrap_or("jev-latest");
+        Some((base_url.to_string(), model.to_string()))
+    }
+}
+
 impl SopConfig {
     /// Whether the SOP runtime (engine, tools, maintenance tick, run store) is
     /// active for this config. SOP loading is gated on a concrete definitions
@@ -26666,6 +27684,447 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_carries_every_ignore_across_matching_groups() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.reddit_all]
+            channel = "reddit"
+            external_peers = ["alice", "@BlockedUser"]
+
+            [peer_groups.reddit_ops]
+            channel = "reddit.ops"
+            external_peers = ["bob"]
+            ignore = ["blockeduser", "bob"]
+
+            [peer_groups.reddit_other]
+            channel = "reddit.other"
+            external_peers = ["mallory"]
+            ignore = ["alice"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        // Every grant and every deny travels, because whether `blockeduser`
+        // names `@BlockedUser` is a question only the channel can answer.
+        assert_eq!(
+            config.channel_external_peers("reddit", "ops"),
+            vec![
+                "@BlockedUser".to_string(),
+                "alice".to_string(),
+                "bob".to_string(),
+                "!blockeduser".to_string(),
+                "!bob".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            config.channel_external_peers("reddit", "other"),
+            vec![
+                "@BlockedUser".to_string(),
+                "alice".to_string(),
+                "mallory".to_string(),
+                "!alice".to_string(),
+            ]
+        );
+
+        // The addressable view is what a caller needing somewhere to send a
+        // message sees: no markers, no wildcard, and nothing an `ignore` names.
+        assert_eq!(
+            config.channel_addressable_peers("reddit", "other"),
+            vec!["@BlockedUser".to_string(), "mallory".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_carries_a_deny_that_only_the_channel_can_match() {
+        // The blocker this encoding exists for. Reddit reads `u/alice` and
+        // `alice` as one account; a resolver comparing the raw strings kept the
+        // grant and dropped the deny, and the channel then authorized the
+        // ignored sender. Both spellings must arrive for the channel to decide.
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.reddit_ops]
+            channel = "reddit.ops"
+            external_peers = ["u/alice"]
+            ignore = ["alice"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_external_peers("reddit", "ops"),
+            vec!["u/alice".to_string(), "!alice".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn grant_and_deny_encodings_never_collide() {
+        // The property the encoding exists for: no identity, however many
+        // markers it opens with, can be encoded as a grant and as a deny onto
+        // the same string. A collision here silently inverts an operator's
+        // rule, which is the failure this whole surface is meant to prevent.
+        let identities = [
+            "alice",
+            "*",
+            "user@example.com",
+            "!user@example.com",
+            "!!user@example.com",
+            "!!!weird",
+            "!",
+            "!!",
+        ];
+        for identity in identities {
+            let grant = super::peer_grant_marker(identity);
+            let deny = super::peer_deny_marker(identity);
+            assert_ne!(grant, deny, "encodings collide for {identity:?}");
+
+            assert_eq!(
+                super::peer_grant_identity(&grant),
+                Some(identity),
+                "grant of {identity:?} must decode to itself"
+            );
+            assert_eq!(
+                super::peer_deny_identity(&grant),
+                None,
+                "grant of {identity:?} must not read as a deny"
+            );
+
+            assert_eq!(
+                super::peer_deny_identity(&deny),
+                Some(identity),
+                "deny of {identity:?} must decode to itself"
+            );
+            assert_eq!(
+                super::peer_grant_identity(&deny),
+                None,
+                "deny of {identity:?} must not read as a grant"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn an_ignore_that_opens_with_the_deny_prefix_still_denies_under_a_wildcard() {
+        // The regression: the previous escape mapped `ignore = ["!user@..."]`
+        // onto the same string as a grant of `!user@...`, so the deny vanished
+        // and the wildcard admitted the sender.
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.email_ops]
+            channel = "email.ops"
+            external_peers = ["*"]
+            ignore = ["!user@example.com"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        let resolved = config.channel_external_peers("email", "ops");
+        assert_eq!(
+            resolved,
+            vec!["*".to_string(), "!!!user@example.com".to_string()]
+        );
+        assert_eq!(
+            super::peer_deny_identity("!!!user@example.com"),
+            Some("!user@example.com"),
+            "the deny survives the round trip"
+        );
+        assert_eq!(super::peer_grant_identity("!!!user@example.com"), None);
+        assert!(
+            config.channel_addressable_peers("email", "ops").is_empty(),
+            "the only named identity is denied, so nothing is addressable"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_escapes_a_grant_that_opens_with_the_deny_prefix() {
+        // RFC 5322 allows `!` to open an email local-part. Emitted raw, the
+        // grant would read back as a deny of `user@example.com` and invert the
+        // operator's intent on the surface whose whole job is authorization.
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.email_ops]
+            channel = "email.ops"
+            external_peers = ["!user@example.com"]
+            ignore = ["blocked@example.com"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        let resolved = config.channel_external_peers("email", "ops");
+        assert_eq!(
+            resolved,
+            vec![
+                "!!user@example.com".to_string(),
+                "!blocked@example.com".to_string(),
+            ]
+        );
+        assert_eq!(
+            super::peer_grant_identity("!!user@example.com"),
+            Some("!user@example.com"),
+            "the escape round-trips to the address the operator wrote"
+        );
+        assert_eq!(super::peer_deny_identity("!!user@example.com"), None);
+        assert_eq!(
+            super::peer_deny_identity("!blocked@example.com"),
+            Some("blocked@example.com")
+        );
+        assert_eq!(
+            config.channel_addressable_peers("email", "ops"),
+            vec!["!user@example.com".to_string()],
+            "the escaped grant is a reachable address, unescaped"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_carries_ignore_past_a_padded_wildcard() {
+        // A wildcard written with surrounding whitespace. Gating marker
+        // emission on the exact string `"*"` emitted nothing here, while a
+        // channel matcher that trims still granted everyone.
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.whatsapp_ops]
+            channel = "whatsapp.ops"
+            external_peers = [" * "]
+            ignore = ["15551234567"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_external_peers("whatsapp", "ops"),
+            vec![" * ".to_string(), "!15551234567".to_string()]
+        );
+        assert!(
+            config
+                .channel_addressable_peers("whatsapp", "ops")
+                .is_empty(),
+            "a wildcard is not an address"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_carries_ignore_past_a_wildcard_grant() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.bluesky_all]
+            channel = "bluesky"
+            external_peers = ["*"]
+
+            [peer_groups.bluesky_ops]
+            channel = "bluesky.ops"
+            ignore = ["alice.bsky.social", "@Mallory"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        // The wildcard survives, so the deny cannot be applied by subtraction.
+        // It has to travel with the list for the channel matcher to enforce.
+        assert_eq!(
+            config.channel_external_peers("bluesky", "ops"),
+            vec![
+                "*".to_string(),
+                "!@Mallory".to_string(),
+                "!alice.bsky.social".to_string(),
+            ]
+        );
+
+        // An alias the instance-scoped ignore does not match keeps the bare
+        // wildcard, so the marker is not leaked to unrelated instances.
+        assert_eq!(
+            config.channel_external_peers("bluesky", "other"),
+            vec!["*".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_for_sees_every_spelling_of_one_channel() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.wecom_all]
+            channel = "wecom-ws.ops"
+            external_peers = ["*"]
+
+            [peer_groups.wecom_ignore]
+            channel = "wecom_ws.ops"
+            ignore = ["alice"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        // Resolved one spelling at a time, the wildcard and the ignore never
+        // meet, so no marker is emitted and concatenating the two results
+        // admits the ignored sender.
+        assert_eq!(
+            config.channel_external_peers("wecom-ws", "ops"),
+            vec!["*".to_string()]
+        );
+        assert_eq!(
+            config.channel_external_peers_for(&["wecom-ws", "wecom_ws"], "ops"),
+            vec!["*".to_string(), "!alice".to_string()]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn channel_external_peers_ignoring_the_wildcard_denies_everyone() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.reddit_all]
+            channel = "reddit"
+            external_peers = ["*"]
+            ignore = ["*"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        // `ignore = ["*"]` is the mirror of a wildcard grant, so it travels as
+        // a wildcard deny. The allowlist treats that as denying every sender,
+        // which is what removing the wildcard by subtraction used to achieve.
+        assert_eq!(
+            config.channel_external_peers("reddit", "ops"),
+            vec!["*".to_string(), "!*".to_string()]
+        );
+        assert!(config.channel_addressable_peers("reddit", "ops").is_empty());
+    }
+
+    /// The case the wildcard-grant test above does not reach. A wildcard deny
+    /// names nobody, so subtracting only the names in the deny set left an
+    /// ordinary grant standing. `auto_detect_heartbeat_channel` takes the first
+    /// addressable entry, so proactive output went to an account the policy
+    /// explicitly denies.
+    #[::core::prelude::v1::test]
+    fn wildcard_deny_leaves_no_named_grant_addressable() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["user123"]
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["*"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_external_peers("telegram", "ops"),
+            vec!["user123".to_string(), "!*".to_string()]
+        );
+        assert!(
+            config
+                .channel_addressable_peers("telegram", "ops")
+                .is_empty(),
+            "a wildcard deny leaves nothing to address"
+        );
+        // The admission side already agreed; this is the delivery side catching up.
+        assert!(
+            config
+                .channel_addressable_peers("telegram", "ops")
+                .is_empty()
+        );
+    }
+
+    /// A blank grant is not a delivery address.
+    ///
+    /// `auto_detect_heartbeat_channel` takes the first entry this returns, so
+    /// leaving `""` in the set makes an empty string a proactive recipient.
+    #[::core::prelude::v1::test]
+    fn a_blank_grant_is_not_addressable() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["", "   "]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert!(
+            config
+                .channel_addressable_peers("telegram", "ops")
+                .is_empty(),
+            "a blank grant gives heartbeat auto-detection nothing to pick"
+        );
+
+        // Control: a real grant beside the blank ones is still addressable, so
+        // this cannot pass by emptying the set for every policy.
+        let mixed: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["", "user456"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        assert_eq!(
+            mixed.channel_addressable_peers("telegram", "ops"),
+            vec!["user456".to_string()]
+        );
+    }
+
+    /// A named deny still removes only that peer, so the wildcard-deny rule
+    /// above cannot pass by emptying the set for every policy.
+    #[::core::prelude::v1::test]
+    fn a_named_deny_leaves_other_grants_addressable() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_grant]
+            channel = "telegram"
+            external_peers = ["user123", "user456"]
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["user123"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_addressable_peers("telegram", "ops"),
+            vec!["user456".to_string()]
+        );
+    }
+
+    /// Voice delivery is delivery. This walked `external_peers` directly and
+    /// never consulted `ignore`, so an explicitly ignored peer still received
+    /// proactive TTS.
+    #[::core::prelude::v1::test]
+    fn voice_peers_drop_an_ignored_peer() {
+        let config: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_voice]
+            channel = "telegram"
+            external_peers = ["user123", "user456"]
+            output_modality = "voice"
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["user123"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_voice_peers("telegram", "ops"),
+            vec!["user456".to_string()],
+            "an ignored peer must not receive proactive voice output"
+        );
+
+        let all_denied: super::Config = toml::from_str(
+            r#"
+            [peer_groups.telegram_voice]
+            channel = "telegram"
+            external_peers = ["user123"]
+            output_modality = "voice"
+
+            [peer_groups.telegram_block]
+            channel = "telegram"
+            ignore = ["*"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        assert!(all_denied.channel_voice_peers("telegram", "ops").is_empty());
+    }
 
     #[::core::prelude::v1::test]
     fn cache_passthrough_deserializes_and_defaults_to_omitted() {
@@ -26676,6 +28135,35 @@ mod tests {
         assert!(
             !serialized.contains("cache_passthrough"),
             "default cache_passthrough must be omitted from serialized config"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn cache_ttl_deserializes_and_defaults_to_omitted() {
+        let one_hour: ModelProviderConfig = toml::from_str("cache_ttl = \"1h\"").unwrap();
+        assert_eq!(one_hour.cache_ttl, Some(CacheTtl::OneHour));
+        assert_eq!(
+            toml::to_string(&one_hour).unwrap(),
+            "cache_ttl = \"1h\"\n",
+            "an explicitly configured cache_ttl must round-trip its wire string"
+        );
+
+        let five_minutes: ModelProviderConfig = toml::from_str("cache_ttl = \"5m\"").unwrap();
+        assert_eq!(five_minutes.cache_ttl, Some(CacheTtl::FiveMinutes));
+
+        let serialized = toml::to_string(&ModelProviderConfig::default()).unwrap();
+        assert!(
+            !serialized.contains("cache_ttl"),
+            "absent cache_ttl must be omitted from serialized config"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn cache_ttl_rejects_unknown_lifetime() {
+        let parsed = toml::from_str::<ModelProviderConfig>("cache_ttl = \"2h\"");
+        assert!(
+            parsed.is_err(),
+            "cache_ttl is a closed enum; unknown lifetimes must not parse into a silent default"
         );
     }
 
@@ -27352,6 +28840,7 @@ mod tests {
             "corp".to_string(),
             OidcConfig {
                 issuer: "https://sso.example.com/realms/main".to_string(),
+                audience: "zeroclaw".to_string(),
                 claim_path: "realm_access.roles".to_string(),
                 profile_map: HashMap::from([(
                     "zeroclaw-operators".to_string(),
@@ -27444,11 +28933,12 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn oidc_requires_issuer_claim_path_and_profile_map() {
-        for strip in ["issuer", "claim_path", "profile_map"] {
+        for strip in ["issuer", "audience", "claim_path", "profile_map"] {
             let mut config = auth_config();
             let oidc = config.oidc.get_mut("corp").unwrap();
             match strip {
                 "issuer" => oidc.issuer.clear(),
+                "audience" => oidc.audience.clear(),
                 "claim_path" => oidc.claim_path.clear(),
                 _ => oidc.profile_map.clear(),
             }
@@ -27683,6 +29173,7 @@ permission_profiles = ["operator"]
 
 [oidc.corp]
 issuer = "https://sso.example.com/realms/main"
+audience = "zeroclaw"
 claim_path = "realm_access.roles"
 
 [oidc.corp.profile_map]
@@ -27700,6 +29191,163 @@ zeroclaw-operators = "operator"
             "operator"
         );
         assert_eq!(config.users["alice"].uid, Some(1000));
+    }
+
+    #[::core::prelude::v1::test]
+    fn wss_without_any_credential_path_fails_validation() {
+        let mut config = Config::default();
+        config.wss.enabled = true;
+        config.gateway.require_pairing = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("remote credential path"), "got: {err}");
+
+        config.gateway.require_pairing = true;
+        config
+            .validate()
+            .expect("pairing-capable wss config is startable");
+
+        config.gateway.require_pairing = false;
+        config.gateway.paired_tokens = vec!["zc_tok".into()];
+        config
+            .validate()
+            .expect("an existing paired token is a path");
+    }
+
+    #[::core::prelude::v1::test]
+    fn security_trust_daemon_uid_defaults_true_via_both_paths() {
+        assert!(SecurityConfig::default().trust_daemon_uid);
+        let parsed: Config = toml::from_str("[security]\n").unwrap();
+        assert!(parsed.security.trust_daemon_uid);
+        let parsed: Config = toml::from_str("[security]\ntrust_daemon_uid = false\n").unwrap();
+        assert!(!parsed.security.trust_daemon_uid);
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_introspection_requires_client_secret() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().validation = OidcValidation::Introspection;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("client_secret"), "got: {err}");
+
+        config.oidc.get_mut("corp").unwrap().client_secret = Some("s3cret".to_string());
+        config
+            .validate()
+            .expect("introspection with secret is valid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_max_auth_lifetime_must_be_positive() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().max_auth_lifetime_secs = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_auth_lifetime_secs"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_verification_defaults_are_bounded() {
+        let defaults = OidcConfig::default();
+        assert_eq!(defaults.validation, OidcValidation::Jwks);
+        assert_eq!(defaults.max_auth_lifetime_secs, 86_400);
+        assert_eq!(defaults.revalidation_secs, 60);
+        assert!(defaults.require_at_jwt);
+        assert!(defaults.required_acr.is_empty());
+        assert!(defaults.service_clients.is_empty());
+        assert!(defaults.interactive_clients.is_empty());
+        assert!(
+            defaults.actor_claim.is_empty(),
+            "no claim-based classification unless the operator declares the claim"
+        );
+        assert_eq!(defaults.actor_claim_marks, OidcActorKind::Service);
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_actor_declarations_are_disjoint_and_nonblank() {
+        let mut config = auth_config();
+        {
+            let oidc = config.oidc.get_mut("corp").unwrap();
+            oidc.service_clients = vec!["portal".to_string()];
+            oidc.interactive_clients = vec!["portal".to_string()];
+        }
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("\"portal\"") && err.contains("actor_claim"),
+            "got: {err}"
+        );
+
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().interactive_clients = vec![" ".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("interactive_clients"), "got: {err}");
+
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().actor_claim = " gty".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("actor_claim"), "got: {err}");
+
+        let mut config = auth_config();
+        {
+            let oidc = config.oidc.get_mut("corp").unwrap();
+            oidc.service_clients = vec!["reporting-batch".to_string()];
+            oidc.interactive_clients = vec!["zerocode-cli".to_string()];
+            oidc.actor_claim = "gty".to_string();
+            oidc.actor_claim_marks = OidcActorKind::Service;
+        }
+        config
+            .validate()
+            .expect("disjoint declarations with a trimmed actor claim validate");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_actor_claim_settings_roundtrip_from_toml() {
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+
+[oidc.corp]
+issuer = "https://sso.example.com/realms/main"
+audience = "zeroclaw"
+claim_path = "realm_access.roles"
+interactive_clients = ["zerocode-cli"]
+actor_claim = "uid"
+actor_claim_marks = "human"
+
+[oidc.corp.profile_map]
+zeroclaw-operators = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("actor settings parse");
+        config.validate().expect("actor settings validate");
+        let oidc = &config.oidc["corp"];
+        assert_eq!(oidc.interactive_clients, vec!["zerocode-cli".to_string()]);
+        assert_eq!(oidc.actor_claim, "uid");
+        assert_eq!(oidc.actor_claim_marks, OidcActorKind::Human);
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_bearer_profile_requires_typed_access_tokens() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().require_at_jwt = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("require_at_jwt"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_debug_redacts_client_secret() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().client_secret = Some("super-secret-value".to_string());
+        let dbg = format!("{:?}", config.oidc["corp"]);
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains("super-secret-value"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_effective_client_id_falls_back_to_audience() {
+        let mut entry = OidcConfig {
+            audience: "zeroclaw".to_string(),
+            ..OidcConfig::default()
+        };
+        assert_eq!(entry.effective_client_id(), "zeroclaw");
+        entry.client_id = "zeroclaw-daemon".to_string();
+        assert_eq!(entry.effective_client_id(), "zeroclaw-daemon");
     }
 
     #[test]
@@ -29014,7 +30662,119 @@ enabled = true
             config: HashMap::new(),
             egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
             egress_allow_private: private.iter().map(|h| (*h).to_string()).collect(),
+            tls_profiles: Vec::new(),
         }
+    }
+
+    fn tls_profile(name: &str, hosts: &[&str]) -> super::PluginTlsProfileConfig {
+        super::PluginTlsProfileConfig {
+            name: name.to_string(),
+            hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            system_roots: true,
+            custom_ca_secret: None,
+            client_certificate_secret: None,
+            client_private_key_secret: None,
+        }
+    }
+
+    fn validate_tls_profiles(
+        grant: &[&str],
+        profiles: Vec<super::PluginTlsProfileConfig>,
+    ) -> anyhow::Result<()> {
+        let mut config = Config::default();
+        let mut entry = plugin_entry_with_egress(grant, &[]);
+        entry.tls_profiles = profiles;
+        config.plugins.entries.push(entry);
+        config.validate()
+    }
+
+    #[test]
+    async fn validate_accepts_tls_profiles_inside_the_grant() {
+        let mut mtls = tls_profile(
+            "corp-mtls",
+            &["imap.corp.example.com", "*.mail.example.com"],
+        );
+        mtls.system_roots = false;
+        mtls.custom_ca_secret = Some("corp_ca".to_string());
+        mtls.client_certificate_secret = Some("client_cert".to_string());
+        mtls.client_private_key_secret = Some("client_key".to_string());
+        validate_tls_profiles(
+            &["imap.corp.example.com", "*.example.com"],
+            vec![mtls, tls_profile("public", &["imap.corp.example.com"])],
+        )
+        .expect("profiles inside the grant must validate");
+    }
+
+    #[test]
+    async fn validate_rejects_a_tls_profile_for_an_ungranted_destination() {
+        let err = validate_tls_profiles(
+            &["imap.example.com"],
+            vec![tls_profile("corp", &["smtp.example.com"])],
+        )
+        .expect_err("a profile must not stand in for a grant");
+        let text = err.to_string();
+        assert!(text.contains("tls_profiles[0].hosts"), "got: {text}");
+        assert!(text.contains("not granted by"), "got: {text}");
+        // A wildcard profile over an exact grant widens it, so it is refused too.
+        assert!(
+            validate_tls_profiles(
+                &["example.com"],
+                vec![tls_profile("corp", &["*.example.com"])]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_incoherent_tls_profiles() {
+        let grant = ["imap.example.com"];
+        let named = |name: &str| tls_profile(name, &grant);
+
+        let mut no_trust = named("empty");
+        no_trust.system_roots = false;
+        let mut half_identity = named("half");
+        half_identity.client_certificate_secret = Some("cert".to_string());
+        let mut bad_secret = named("bad-ref");
+        bad_secret.custom_ca_secret = Some("../escape".to_string());
+
+        for (label, profiles) in [
+            ("bad name", vec![named("Upper")]),
+            ("duplicate", vec![named("same"), named("same")]),
+            ("no hosts", vec![tls_profile("none", &[])]),
+            ("no trust anchor", vec![no_trust]),
+            ("half an identity", vec![half_identity]),
+            ("non-portable secret", vec![bad_secret]),
+        ] {
+            assert!(
+                validate_tls_profiles(&grant, profiles).is_err(),
+                "{label} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    async fn tls_profiles_round_trip_through_toml() {
+        let parsed: Config = toml::from_str(
+            r#"
+[[plugins.entries]]
+name = "mail"
+egress_hosts = ["imap.example.com"]
+
+[[plugins.entries.tls_profiles]]
+name = "corp"
+hosts = ["imap.example.com"]
+system_roots = false
+custom_ca_secret = "corp_ca"
+"#,
+        )
+        .expect("tls_profiles parse");
+        let profiles = parsed.plugins.entry_tls_profiles("mail");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].name, "corp");
+        assert!(!profiles[0].system_roots);
+        assert_eq!(profiles[0].custom_ca_secret.as_deref(), Some("corp_ca"));
+        assert!(parsed.plugins.entry_tls_profiles("absent").is_empty());
+        parsed.validate().expect("parsed profile validates");
     }
 
     #[test]
@@ -30531,6 +32291,7 @@ auto_save = true
                 );
                 m
             },
+            decision_models: HashMap::new(),
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
@@ -30848,6 +32609,47 @@ auto_approve = ["my_custom_tool", "another_tool"]
     async fn default_auto_approve_includes_tool_search() {
         let defaults = default_auto_approve();
         assert!(defaults.contains(&"tool_search".to_string()));
+    }
+
+    /// Security guard: the full `browser` automation tool drives a real
+    /// Chrome/Chromium session that may already be logged in, so it must
+    /// never be silently auto-approved — a prompt-injected message would
+    /// otherwise act as the operator with no approval prompt.
+    /// `browser_open` (hand a URL to the system browser, no scraping or
+    /// interaction) stays on the list.
+    #[test]
+    async fn default_auto_approve_excludes_browser_automation() {
+        let defaults = default_auto_approve();
+        assert!(
+            !defaults.contains(&"browser".to_string()),
+            "full browser automation must not be auto-approved by default"
+        );
+        assert!(
+            defaults.contains(&"browser_open".to_string()),
+            "browser_open must stay auto-approved"
+        );
+    }
+
+    /// The forced merge in `ensure_default_auto_approve` must not put
+    /// `browser` back on an operator's list at load time.
+    #[test]
+    async fn ensure_default_auto_approve_does_not_add_browser_automation() {
+        let raw = r#"
+default_temperature = 0.7
+
+[risk_profiles.default]
+auto_approve = []
+"#;
+        let parsed = parse_test_config(raw);
+        let profile = parsed.risk_profiles.get("default").unwrap();
+        assert!(
+            !profile.auto_approve.contains(&"browser".to_string()),
+            "loading a config must not merge `browser` into auto_approve"
+        );
+        assert!(
+            profile.auto_approve.contains(&"browser_open".to_string()),
+            "browser_open must still be merged in"
+        );
     }
 
     /// Regression test: empty auto_approve still gets defaults merged.
@@ -31352,7 +33154,7 @@ runtime_profile = "fast"
     }
 
     #[test]
-    async fn runtime_profile_structured_history_cap_scales_when_omitted() {
+    async fn runtime_profile_structured_history_cap_counts_turns_when_omitted() {
         let raw = r#"
 [runtime_profiles.long_turn]
 max_tool_iterations = 100
@@ -31364,7 +33166,7 @@ runtime_profile = "long_turn"
         assert_eq!(parsed.effective_max_history_messages("default"), 50);
         assert_eq!(
             parsed.effective_structured_max_history_messages("default"),
-            202
+            50
         );
         let agent = parsed.resolved_agent_config("default").unwrap();
         assert_eq!(agent.resolved.max_history_messages, 50);
@@ -31411,7 +33213,7 @@ runtime_profile = "long_turn"
     }
 
     #[test]
-    async fn runtime_profile_history_cap_saturates_at_usize_max() {
+    async fn runtime_profile_tool_iterations_do_not_change_history_turn_limit() {
         let mut config = Config::default();
         config.runtime_profiles.insert(
             "long_turn".to_string(),
@@ -31430,7 +33232,7 @@ runtime_profile = "long_turn"
 
         assert_eq!(
             config.effective_structured_max_history_messages("default"),
-            usize::MAX
+            50
         );
         assert_eq!(config.effective_max_history_messages("default"), 50);
     }
@@ -31445,7 +33247,6 @@ runtime_profile = "long_turn"
             50
         );
     }
-
     #[test]
     async fn pacing_config_defaults_are_all_none_or_empty() {
         let cfg = PacingConfig::default();
@@ -31750,6 +33551,7 @@ default_temperature = 0.7
             delegate: DelegateToolConfig::default(),
             agents: HashMap::new(),
             risk_profiles: HashMap::new(),
+            decision_models: HashMap::new(),
             oidc: HashMap::new(),
             users: HashMap::new(),
             permission_profiles: HashMap::new(),
@@ -33637,6 +35439,10 @@ default_temperature = 0.7
     async fn browser_config_default_enabled() {
         let b = BrowserConfig::default();
         assert!(b.enabled);
+        assert!(
+            !b.automation_enabled,
+            "full browser automation must be opt-in"
+        );
         assert_eq!(b.allowed_domains, vec!["*".to_string()]);
         assert_eq!(b.backend, "agent_browser");
         assert_eq!(b.headed, None);
@@ -33655,6 +35461,7 @@ default_temperature = 0.7
     async fn browser_config_serde_roundtrip() {
         let b = BrowserConfig {
             enabled: true,
+            automation_enabled: true,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
@@ -33676,6 +35483,7 @@ default_temperature = 0.7
         let toml_str = toml::to_string(&b).unwrap();
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.enabled);
+        assert!(parsed.automation_enabled);
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
@@ -33722,7 +35530,99 @@ default_temperature = 0.7
 "#;
         let parsed = parse_test_config(minimal);
         assert!(parsed.browser.enabled);
+        assert!(!parsed.browser.automation_enabled);
         assert_eq!(parsed.browser.allowed_domains, vec!["*".to_string()]);
+    }
+
+    /// Migration guard: a pre-split config that opted into `[browser]` gets
+    /// `browser_open` but NOT full automation. Operators must add
+    /// `automation_enabled = true` themselves.
+    #[test]
+    async fn browser_automation_stays_off_for_pre_split_configs() {
+        let raw = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[browser]
+enabled = true
+allowed_domains = ["example.com"]
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.browser.enabled);
+        assert!(
+            !parsed.browser.automation_enabled,
+            "`enabled = true` alone must not re-grant full browser automation"
+        );
+    }
+
+    /// The two flags are independent: automation can be turned on without
+    /// `browser_open`, and vice versa.
+    #[test]
+    async fn browser_automation_enabled_parses_independently() {
+        let raw = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[browser]
+enabled = false
+automation_enabled = true
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(!parsed.browser.enabled);
+        assert!(parsed.browser.automation_enabled);
+    }
+
+    /// The operator-visible integration status must follow both gates. One
+    /// flag alone misreports two of the four combinations: a default config
+    /// would advertise Chrome/Chromium control that is not registered, and
+    /// an automation-only config would read as inactive while automation is
+    /// live.
+    #[test]
+    async fn browser_integration_descriptor_tracks_both_flags() {
+        for (enabled, automation_enabled, expected_active) in [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let b = BrowserConfig {
+                enabled,
+                automation_enabled,
+                ..BrowserConfig::default()
+            };
+            assert_eq!(
+                b.integration_active(),
+                expected_active,
+                "integration_active wrong for enabled={enabled}, \
+                 automation_enabled={automation_enabled}"
+            );
+            assert_eq!(
+                b.integration_descriptor().active,
+                expected_active,
+                "descriptor.active wrong for enabled={enabled}, \
+                 automation_enabled={automation_enabled}"
+            );
+        }
+    }
+
+    /// The descriptor copy names both surfaces this section gates, so an
+    /// Active "Browser" row is not read as automation-only.
+    #[test]
+    async fn browser_integration_descriptor_description_covers_both_tools() {
+        let descriptor = BrowserConfig::default().integration_descriptor();
+        assert_eq!(descriptor.display_name, "Browser");
+        assert!(
+            descriptor.description.contains("Open URLs"),
+            "description must mention opening URLs: {:?}",
+            descriptor.description
+        );
+        assert!(
+            descriptor.description.contains("Chrome/Chromium"),
+            "description must mention browser control: {:?}",
+            descriptor.description
+        );
     }
 
     async fn env_override_lock() -> MutexGuard<'static, ()> {
@@ -37664,6 +39564,73 @@ group_policy = "disabled"
         );
     }
 
+    // The certificate issuance and renewal trail is written through this
+    // section, so the default has to stay `true`: an operator who never
+    // touches `[security.audit]` still gets the certificate record. Both the
+    // typed default and the omitted-TOML path are asserted, because the two
+    // are separate code paths (`Default` versus `serde(default = ...)`).
+    #[test]
+    async fn audit_config_default_is_enabled() {
+        assert!(
+            AuditConfig::default().enabled,
+            "security.audit.enabled must default to true so certificate \
+             issuance and renewal stay audited"
+        );
+
+        let config: Config = toml::from_str("").expect("empty TOML loads with defaults");
+        assert!(config.security.audit.enabled);
+    }
+
+    // Disabling the section silently stops the certificate trail:
+    // `AuditLogger::log` returns `Ok(())` without writing, so the caller sees
+    // a success it did not get. The warning is the only place that says so.
+    #[test]
+    async fn collect_warnings_flags_disabled_audit_dropping_certificate_record() {
+        let mut config: Config = toml::from_str(
+            r#"
+[security.audit]
+enabled = false
+"#,
+        )
+        .expect("explicit audit setting loads from TOML");
+        suppress_semantic_memory_warning(&mut config);
+
+        let warnings = warnings_with_code(
+            &config,
+            crate::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+        );
+        assert_eq!(warnings.len(), 1);
+        let w = &warnings[0];
+        assert_eq!(w.path, "security.audit.enabled");
+        assert!(
+            w.message
+                .contains("issued and renewed with no audit record"),
+            "warning should name the certificate record that is lost: {}",
+            w.message
+        );
+        assert!(
+            w.message.contains("Command execution is not audited"),
+            "warning should scope the claim to command execution rather than \
+             to the whole section: {}",
+            w.message
+        );
+    }
+
+    // The default config keeps the certificate trail, so there is nothing to
+    // report and no operator sees this warning on a stock install.
+    #[test]
+    async fn collect_warnings_silent_when_audit_left_default() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        assert!(
+            warnings_with_code(
+                &config,
+                crate::validation_warnings::SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD,
+            )
+            .is_empty()
+        );
+    }
+
     /// The section is opt-in, so an operator who has not touched it is told
     /// nothing.
     #[test]
@@ -39071,6 +41038,56 @@ url = "http://localhost:8080/mcp"
             .unwrap();
         assert!(soul.contains("SOUL.md"));
         assert!(identity.contains("IDENTITY.md"));
+    }
+
+    #[tokio::test]
+    async fn ensure_map_or_list_key_for_path_creates_a_missing_keyed_list_row() {
+        let mut config = Config::default();
+        let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
+        let path = format!("plugins.entries.{key}.egress_hosts");
+        assert!(config.get_prop(&path).is_err(), "no row to begin with");
+
+        assert!(!config.ensure_map_or_list_key_for_path(&path));
+        config
+            .set_prop(&path, "api.example.com")
+            .expect("the created row takes the value");
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == key)
+            .expect("the row exists under its natural key");
+        assert_eq!(entry.egress_hosts, vec!["api.example.com".to_string()]);
+
+        // A second call leaves the existing row, and its value, alone.
+        assert!(!config.ensure_map_or_list_key_for_path(&path));
+        assert_eq!(config.plugins.entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_map_or_list_key_for_path_rolls_back_a_list_row_whose_tail_field_is_unknown() {
+        let mut config = Config::default();
+        let path = "plugins.entries.zpi1_abc.not_a_real_field";
+        assert!(!config.ensure_map_or_list_key_for_path(path));
+        assert!(
+            config.plugins.entries.is_empty(),
+            "a typo'd field must not leave a phantom row"
+        );
+    }
+
+    /// The remote config APIs keep the map-only rule: over them, a new
+    /// `plugins.entries` row carrying `egress_hosts` would grant network reach.
+    #[tokio::test]
+    async fn ensure_map_key_for_path_still_does_not_create_list_rows() {
+        let mut config = Config::default();
+        config.ensure_map_key_for_path("plugins.entries.zpi1_abc.egress_hosts");
+        assert!(config.plugins.entries.is_empty());
+        assert!(
+            config
+                .set_prop("plugins.entries.zpi1_abc.egress_hosts", "api.example.com")
+                .is_err(),
+            "without the list-aware call the row stays absent"
+        );
     }
 
     #[tokio::test]
@@ -44042,6 +46059,116 @@ allowed_users = []
         assert!(
             warnings_with_code(&config, PEER_GROUP_CHANNEL_DANGLING_WARNING).is_empty(),
             "a bare type-wide ref must never warn, even though it authorizes every alias"
+        );
+    }
+
+    /// Each modality resolves to its own groups' members only, and
+    /// `channel_voice_peers` — the resolver proactive delivery consults — sees
+    /// nothing but the `voice` group.
+    #[test]
+    async fn channel_modality_peers_filters_by_modality() {
+        use crate::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
+
+        let mut config = Config::default();
+        config.peer_groups.insert(
+            "always_voice".to_string(),
+            PeerGroupConfig {
+                channel: "matrix.default".into(),
+                external_peers: vec![PeerUsername::new("@alice:server")],
+                output_modality: OutputModality::Voice,
+                ..PeerGroupConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "always_text".to_string(),
+            PeerGroupConfig {
+                channel: "matrix.default".into(),
+                external_peers: vec![PeerUsername::new("@bob:server")],
+                output_modality: OutputModality::Text,
+                ..PeerGroupConfig::default()
+            },
+        );
+        // No explicit modality: the default is `mirror`.
+        config.peer_groups.insert(
+            "family".to_string(),
+            PeerGroupConfig {
+                channel: "matrix".into(),
+                external_peers: vec![PeerUsername::new("@carol:server")],
+                ..PeerGroupConfig::default()
+            },
+        );
+
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Voice),
+            vec!["@alice:server".to_string()],
+            "voice resolves the voice group only"
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Text),
+            vec!["@bob:server".to_string()],
+            "text resolves the text group only"
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Mirror),
+            vec!["@carol:server".to_string()],
+            "mirror resolves the group without an explicit modality"
+        );
+        assert_eq!(
+            config.channel_voice_peers("matrix", "default"),
+            vec!["@alice:server".to_string()],
+            "the voice resolver never names a text or mirror member"
+        );
+        assert!(
+            config
+                .channel_modality_peers("matrix", "other", OutputModality::Voice)
+                .is_empty(),
+            "a dotted group does not apply to another alias"
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "other", OutputModality::Mirror),
+            vec!["@carol:server".to_string()],
+            "a type-wide group applies to every alias"
+        );
+    }
+
+    #[test]
+    async fn channel_modality_peers_drop_an_ignored_peer() {
+        use crate::multi_agent::OutputModality;
+
+        let config: Config = toml::from_str(
+            r#"
+            [peer_groups.matrix_voice]
+            channel = "matrix"
+            external_peers = ["@alice:server", "@voice-ok:server"]
+            output_modality = "voice"
+
+            [peer_groups.matrix_text]
+            channel = "matrix"
+            external_peers = ["@alice:server", "@text-ok:server"]
+            output_modality = "text"
+
+            [peer_groups.matrix_mirror]
+            channel = "matrix"
+            external_peers = ["@alice:server", "@mirror-ok:server"]
+
+            [peer_groups.matrix_block]
+            channel = "matrix"
+            ignore = ["alice:server"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Voice),
+            vec!["@voice-ok:server".to_string()]
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Text),
+            vec!["@text-ok:server".to_string()]
+        );
+        assert_eq!(
+            config.channel_modality_peers("matrix", "default", OutputModality::Mirror),
+            vec!["@mirror-ok:server".to_string()]
         );
     }
 

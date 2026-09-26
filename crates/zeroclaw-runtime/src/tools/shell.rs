@@ -658,7 +658,11 @@ mod tests {
     }
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
-        Arc::new(NativeRuntime::new())
+        #[cfg(windows)]
+        let runtime = NativeRuntime::with_shell("cmd.exe".into());
+        #[cfg(not(windows))]
+        let runtime = NativeRuntime::new();
+        Arc::new(runtime)
     }
 
     #[cfg(windows)]
@@ -871,6 +875,67 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn powershell_bounded_command_configures_redirected_stdout_as_utf8() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let encoding = tool
+            .execute(json!({
+                "command": "Write-Output $OutputEncoding.WebName",
+                "approved": true
+            }))
+            .await
+            .expect("PowerShell encoding probe should return a result");
+        assert!(encoding.success, "PowerShell command failed: {encoding:?}");
+        assert_eq!(encoding.output.trim(), "utf-8");
+
+        let output = tool
+            .execute(json!({
+                "command": "Write-Output '标准输出'",
+                "approved": true
+            }))
+            .await
+            .expect("PowerShell UTF-8 output should return a result");
+        assert!(output.success, "PowerShell command failed: {output:?}");
+        assert_eq!(output.output.trim(), "标准输出");
+        assert!(output.error.is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_hidden_redirected_output_decodes_stdout_and_stderr_as_utf8() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+        let command = "[Console]::Write('标准输出'); $bytes = [Text.Encoding]::UTF8.GetBytes('标准错误'); [Console]::OpenStandardError().Write($bytes, 0, $bytes.Length)";
+
+        let result = tool
+            .execute(json!({"command": command, "approved": true}))
+            .await
+            .expect("PowerShell execution should return a result");
+
+        assert!(result.success, "PowerShell command failed: {result:?}");
+        assert_eq!(result.output, "标准输出");
+        assert_eq!(result.error.as_deref(), Some("标准错误"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn shell_executes_windows_nul_redirect_through_cmd_exe() {
         // Native-Windows runtime boundary through the FULLY WRAPPED production
         // shape (`RateLimitedTool<ShellTool>`). `test_runtime()` is
@@ -964,22 +1029,12 @@ mod tests {
     async fn shell_blocks_disallowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
-            .execute(json!({"command": "rm -rf /"}))
+            .execute(json!({"command": "zeroclaw_disallowed_test_command"}))
             .await
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
-        // Which guard refuses first is dialect-dependent: on POSIX hosts the
-        // allowlist/high-risk checks fire, while under the Windows shell
-        // dialect the forbidden-path scan sees `/` (current-drive root) first
-        // and refuses with its own message. All three are the required
-        // refusal; none may be weakened into a pass.
-        assert!(
-            error.contains("not allowed")
-                || error.contains("high-risk")
-                || error.contains("forbidden path argument"),
-            "expected a refusal reason, got: {error:?}"
-        );
+        assert!(error.contains("not allowed"), "unexpected error: {error}");
     }
 
     #[tokio::test]
@@ -1449,6 +1504,68 @@ mod tests {
             shell_env_passthrough: vars.iter().map(|v| (*v).to_string()).collect(),
             ..SecurityPolicy::default()
         })
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_preserves_inherited_powershell_cache_path() {
+        const CHILD: &str = "ZEROCLAW_SHELL_CACHE_TEST_CHILD";
+        const KEY: &str = "PSModuleAnalysisCachePath";
+        const VALUE: &str = r"C:\synthetic cache\ModuleAnalysisCache";
+
+        if let Ok(case) = std::env::var(CHILD) {
+            let expected = match case.as_str() {
+                "present" => Some(VALUE),
+                "absent" => None,
+                _ => panic!("unknown cache forwarding test case"),
+            };
+            assert_eq!(std::env::var(KEY).ok().as_deref(), expected);
+            let tool = ShellTool::new(
+                test_security_with_env_cmd(),
+                Arc::new(NativeRuntime::with_shell("cmd".into())),
+            );
+            let result = tool
+                .execute(json!({"command": format!("set {KEY}"), "approved": true}))
+                .await
+                .unwrap();
+            if let Some(value) = expected {
+                assert!(result.success, "{:?}", result.error);
+                assert_eq!(result.output.trim(), format!("{KEY}={value}"));
+            } else {
+                assert!(!result.success);
+                assert!(result.output.trim().is_empty());
+                assert!(result.error.as_deref().unwrap_or_default().contains(KEY));
+            }
+            return;
+        }
+
+        // Set the inherited value only on a separate harness process, never on
+        // the shared test process. cmd reads it without touching a cache file.
+        for case in ["present", "absent"] {
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tools::shell::tests::shell_preserves_inherited_powershell_cache_path",
+                ])
+                .env(CHILD, case)
+                .kill_on_drop(true);
+            if case == "present" {
+                child.env(KEY, VALUE);
+            } else {
+                child.env_remove(KEY);
+            }
+            let output = tokio::time::timeout(std::time::Duration::from_secs(120), child.output())
+                .await
+                .expect("isolated cache test timed out")
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success(), "{case}: {stdout}");
+            assert!(
+                stdout.contains("1 passed;"),
+                "exact child test was not executed: {stdout}"
+            );
+        }
     }
 
     #[cfg(target_os = "windows")]
